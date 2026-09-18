@@ -1,0 +1,1272 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>duckmetrics-dashboard — client-side telemetry</title>
+  <meta
+    name="description"
+    content="Zero-server-query dashboard for duckmetrics Fjall/Parquet exports. DuckDB-Wasm in your browser queries remote Parquet over HTTP."
+  />
+  <style>
+:root {
+  color-scheme: dark;
+  --bg: #0b1220;
+  --bg-soft: #0f172a;
+  --panel: #111c33;
+  --border: #1e2a45;
+  --text: #e2e8f0;
+  --muted: #8b93a7;
+  --accent: #38bdf8;
+  --accent-2: #a78bfa;
+  --good: #34d399;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: radial-gradient(1200px 600px at 20% -10%, #14264a 0%, var(--bg) 55%) fixed,
+    var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: rgba(148, 163, 184, 0.12);
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+/* ---------- header ---------- */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(11, 18, 32, 0.85);
+  backdrop-filter: blur(8px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand { display: flex; gap: 12px; align-items: center; }
+.brand h1 { font-size: 1.05rem; margin: 0; letter-spacing: 0.01em; }
+.subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.8rem; }
+.brand-icon { width: 30px; height: 30px; color: var(--accent); }
+
+.controls-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+.src-label, .range-label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+.src-label svg, .range-label svg { width: 16px; height: 16px; }
+
+input, select {
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 0.85rem;
+}
+
+input:focus-visible, select:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.btn svg { width: 15px; height: 15px; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: #0c4a6e; border-color: #0369a1; }
+.btn.primary:hover { background: #075985; }
+
+.status { display: flex; gap: 8px; align-items: center; font-size: 0.8rem; color: var(--muted); max-width: 320px; }
+#statusText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #475569; flex: none; }
+.dot[data-phase="wasm-loading"], .dot[data-phase="metadata-loading"], .dot[data-phase="querying"] {
+  background: var(--warn);
+  animation: pulse 1s infinite alternate;
+}
+.dot[data-phase="wasm-ready"], .dot[data-phase="idle"] { background: var(--good); }
+.dot[data-phase="error"] { background: var(--bad); }
+@keyframes pulse { from { opacity: 0.4; } to { opacity: 1; } }
+
+/* ---------- layout ---------- */
+
+.banner {
+  margin: 12px 20px 0;
+  padding: 10px 14px;
+  border: 1px solid #7f1d1d;
+  background: rgba(248, 113, 113, 0.1);
+  border-radius: 10px;
+  font-size: 0.85rem;
+}
+.hidden { display: none !important; }
+
+.layout {
+  display: grid;
+  gap: 14px;
+  padding: 16px 20px 28px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.layout.loading .panel { opacity: 0.75; }
+
+.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.stat-card {
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.08), transparent 60%), var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.stat-card header { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.stat-card header svg { width: 15px; height: 15px; color: var(--accent); }
+.stat-value { font-size: 1.5rem; font-weight: 650; margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.panel > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.panel h2 { font-size: 0.95rem; margin: 0; display: flex; gap: 8px; align-items: center; }
+.panel h2 svg { width: 16px; height: 16px; color: var(--accent-2); }
+.badge {
+  font-size: 0.72rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.chart { width: 100%; height: 300px; }
+.chart-fallback { color: var(--muted); padding: 40px; text-align: center; }
+
+.custom-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 8px; }
+.custom-form label { display: grid; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+
+.sql-details { margin-top: 8px; }
+.sql-details summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; }
+.sql-details pre {
+  background: #020617;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow: auto;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+}
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  justify-content: space-between;
+  padding: 12px 20px 20px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+@media (max-width: 900px) {
+  .cards { grid-template-columns: repeat(2, 1fr); }
+  .chart { height: 260px; }
+}
+@media (max-width: 560px) {
+  .cards { grid-template-columns: 1fr; }
+  .src-label input { width: 100%; }
+  .src-label { flex: 1 1 100%; }
+}
+
+</style>
+  <script type="importmap">
+    {
+      "imports": {
+        "@duckdb/duckdb-wasm": "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm",
+        "apache-arrow": "https://cdn.jsdelivr.net/npm/apache-arrow@16.1.0/+esm"
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/dist/umd/lucide.min.js" defer></script>
+<!-- bundled: npm run build (duckmetrics-dashboard) -->
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <i data-lucide="activity" class="brand-icon"></i>
+      <div>
+        <h1>duckmetrics-dashboard</h1>
+        <p class="subtitle">browser-side analytics over <code>/telemetry/parquet</code></p>
+      </div>
+    </div>
+    <div class="controls-bar">
+      <label class="src-label" for="srcInput">
+        <i data-lucide="database"></i>
+        <input
+          id="srcInput"
+          type="url"
+          size="34"
+          spellcheck="false"
+          placeholder="http://localhost:3000  or  https://host/path.parquet"
+          value="http://localhost:3000"
+        />
+      </label>
+      <button id="srcGo" class="btn primary" title="Connect to this source">
+        <i data-lucide="plug-zap"></i>Connect
+      </button>
+      <label class="range-label" for="rangeSelect">
+        <i data-lucide="calendar-range"></i>
+        <select id="rangeSelect">
+          <option value="1h">Last 1 Hour</option>
+          <option value="24h" selected>Last 24 Hours</option>
+          <option value="all">All Time</option>
+        </select>
+      </label>
+      <button id="refreshBtn" class="btn" title="Re-run all queries">
+        <i data-lucide="refresh-cw"></i>Refresh
+      </button>
+      <span class="status" title="engine status">
+        <span id="statusDot" class="dot" data-phase="idle"></span>
+        <span id="statusText">initializing…</span>
+      </span>
+    </div>
+  </header>
+
+  <div id="errorBanner" class="banner hidden" role="alert"></div>
+
+  <main id="main" class="layout">
+    <section class="cards" aria-label="summary">
+      <article class="stat-card">
+        <header><i data-lucide="hash"></i>Total Requests</header>
+        <div id="statTotal" class="stat-value">—</div>
+      </article>
+      <article class="stat-card">
+        <header><i data-lucide="timer"></i>Avg Latency</header>
+        <div id="statAvg" class="stat-value">—</div>
+      </article>
+      <article class="stat-card">
+        <header><i data-lucide="gauge"></i>Peak Throughput</header>
+        <div id="statPeak" class="stat-value">—</div>
+      </article>
+      <article class="stat-card">
+        <header><i data-lucide="triangle-alert"></i>Error Rate</header>
+        <div id="statErr" class="stat-value">—</div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="chart-line"></i>Request throughput</h2>
+        <span id="modeBadge" class="badge">not connected</span>
+      </header>
+      <div id="chartThroughput" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="chart-spline"></i>Latency: average &amp; p99 (ms)</h2>
+      </header>
+      <div id="chartLatency" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="chart-column"></i>Error distribution by path (4xx / 5xx)</h2>
+      </header>
+      <div id="chartErrors" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="sliders-horizontal"></i>Custom metric visualizer</h2>
+      </header>
+      <div class="custom-form">
+        <label>Metric
+          <select id="metricSelect">
+            <option>http_request_duration_ms</option>
+          </select>
+        </label>
+        <label>Aggregation
+          <select id="aggSelect">
+            <option value="avg" selected>avg</option>
+            <option value="p50">p50</option>
+            <option value="p99">p99</option>
+            <option value="sum">sum</option>
+            <option value="count">count</option>
+            <option value="min">min</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label>Label key
+          <input id="labelKey" placeholder="e.g. path" size="12" />
+        </label>
+        <label>Label value
+          <input id="labelValue" placeholder="e.g. /orders" size="12" />
+        </label>
+        <button id="customRun" class="btn primary"><i data-lucide="play"></i>Plot</button>
+      </div>
+      <div id="chartCustom" class="chart"></div>
+      <details class="sql-details">
+        <summary>Generated SQL</summary>
+        <pre id="sqlPreview">-- run a query to preview the SQL here</pre>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>100% client-side: DuckDB-Wasm queries <code>/telemetry/parquet</code> with HTTP range requests; no server query code.</span>
+    <span>Serve with <code>npm run mock-server</code> for isolated development.</span>
+  </footer>
+
+  <script type="module">
+import * as duckdb from '@duckdb/duckdb-wasm';
+
+/* ---- js/queries.js ---- */
+//! Analytical SQL builders for the duckmetrics Parquet consumption contract.
+//!
+//! Cold export schema (see duckmetrics `parquet_exporter.rs`):
+//! `ts Timestamp(Microsecond)`, `name Utf8`, `value Float64`,
+//! `metric_type Utf8`, `labels Utf8` (JSON object string).
+//!
+//! Dialect notes (DuckDB-WASM):
+//! * `labels` is a Utf8 JSON *string*, so label access uses
+//!   `json_extract_string(labels, '$.<key>')` — not Postgres `->>`.
+//! * Time column is `ts` (not `timestamp`).
+//! * Bucketing uses `date_trunc('<part>', ts)` (portable in WASM) instead of
+//!   the `time_bucket(INTERVAL …)` extension function.
+//! * Bucket output is `epoch_us(…)` microseconds as `bucket_us` so
+//!   Arrow/BigInt handling in JS stays unambiguous.
+//!
+//! This module is DOM-free so it can be `node --check`ed and unit-tested.
+
+/// Time ranges offered by the UI dropdown.
+const Ranges = {
+  '1h': { label: 'Last 1 Hour', bucketPart: 'minute', bucketSecs: 60 },
+  '24h': { label: 'Last 24 Hours', bucketPart: 'hour', bucketSecs: 3600 },
+  all: { label: 'All Time', bucketPart: 'day', bucketSecs: 86400 },
+};
+
+/// Escape a string for embedding in a single-quoted SQL literal.
+function lit(value) {
+  return String(value).replaceAll("'", "''");
+}
+
+/// `WHERE`-fragment for a range key. Returns `TRUE` for `all`.
+function timeFilter(range) {
+  if (range === '1h') return "ts >= (now() - INTERVAL 1 HOUR)";
+  if (range === '24h') return "ts >= (now() - INTERVAL 24 HOUR)";
+  return 'TRUE';
+}
+
+/// Bucket expression for a range key, e.g. `date_trunc('minute', ts)`.
+function bucketExpr(range) {
+  const part = (Ranges[range] ?? Ranges['24h']).bucketPart;
+  return `date_trunc('${part}', ts)`;
+}
+
+const Queries = {
+  Ranges,
+  timeFilter,
+  bucketExpr,
+
+  /// Request throughput + latency breakdown in a single round-trip.
+  throughputLatency(range) {
+    const filter = timeFilter(range);
+    const bucket = bucketExpr(range);
+    return (
+      `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
+      `  count(*) FILTER (WHERE name = 'http_requests_total') AS reqs,\n` +
+      `  avg(value) FILTER (WHERE name = 'http_request_duration_ms') AS avg_ms,\n` +
+      `  quantile_cont(value, 0.99) FILTER (WHERE name = 'http_request_duration_ms') AS p99_ms\n` +
+      `FROM metrics_all\n` +
+      `WHERE ${filter}\n` +
+      `GROUP BY 1\n` +
+      `ORDER BY 1`
+    );
+  },
+
+  /// HTTP 4xx/5xx breakdown grouped by endpoint path.
+  errorDistribution(range) {
+    const filter = timeFilter(range);
+    return (
+      `SELECT COALESCE(NULLIF(json_extract_string(labels, '$.path'), ''), '(unknown)') AS path,\n` +
+      `  count(*) FILTER (WHERE json_extract_string(labels, '$.status') LIKE '4%') AS c4xx,\n` +
+      `  count(*) FILTER (WHERE json_extract_string(labels, '$.status') LIKE '5%') AS c5xx,\n` +
+      `  count(*) AS total\n` +
+      `FROM metrics_all\n` +
+      `WHERE name = 'http_requests_total' AND ${filter}\n` +
+      `GROUP BY 1\n` +
+      `HAVING (c4xx + c5xx) > 0\n` +
+      `ORDER BY (c4xx + c5xx) DESC\n` +
+      `LIMIT 20`
+    );
+  },
+
+  /// Distinct metric names for the custom visualizer dropdown.
+  listMetricNames() {
+    return 'SELECT DISTINCT name FROM metrics_all ORDER BY 1 LIMIT 200';
+  },
+
+  /// General-purpose counter/gauge series builder.
+  ///
+  /// `opts`: `{ metric, agg, labelKey, labelValue, range }`.
+  /// `agg` ∈ `count|sum|avg|min|max|p50|p99`.
+  customSeries(opts) {
+    const { metric, agg = 'avg', labelKey = '', labelValue = '', range = '24h' } = opts;
+    const filter = timeFilter(range);
+    const bucket = bucketExpr(range);
+    const aggSql = (() => {
+      switch (agg) {
+        case 'count':
+          return 'count(*)';
+        case 'sum':
+          return 'sum(value)';
+        case 'min':
+          return 'min(value)';
+        case 'max':
+          return 'max(value)';
+        case 'p50':
+          return 'quantile_cont(value, 0.5)';
+        case 'p99':
+          return 'quantile_cont(value, 0.99)';
+        case 'avg':
+        default:
+          return 'avg(value)';
+      }
+    })();
+    let labelClause = '';
+    if (labelKey.trim() !== '') {
+      const key = lit(labelKey.trim());
+      if (labelValue.trim() !== '') {
+        labelClause = ` AND json_extract_string(labels, '$.${key}') = '${lit(labelValue.trim())}'`;
+      } else {
+        labelClause = ` AND json_extract_string(labels, '$.${key}') IS NOT NULL AND json_extract_string(labels, '$.${key}') <> ''`;
+      }
+    }
+    return (
+      `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
+      `  ${aggSql} AS v,\n` +
+      `  count(*) AS n\n` +
+      `FROM metrics_all\n` +
+      `WHERE name = '${lit(metric)}' AND ${filter}${labelClause}\n` +
+      `GROUP BY 1\n` +
+      `ORDER BY 1`
+    );
+  },
+};
+
+
+/* ---- js/duckdb_worker.js ---- */
+//! DuckDB-WASM engine: WASM runs inside a Web Worker so SQL never blocks
+//! the main thread (60 FPS UI). Hybrid Parquet access:
+//!  1. `httpfs` range-requests against the remote URL(s) — only metadata +
+//!     needed row-groups travel the wire.
+//!  2. Fallback: `fetch` the whole file(s) + `registerFileBuffer`, for
+//!     servers without CORS/Range support.
+//!
+//! All analytical SQL reads the `metrics_all` view installed by
+//! `ensureView()`. Status transitions are pushed to the subscriber so the
+//! UI can render graceful loading states.
+
+
+const EnginePhases = {
+  WASM_LOADING: 'wasm-loading',
+  WASM_READY: 'wasm-ready',
+  METADATA_LOADING: 'metadata-loading',
+  QUERYING: 'querying',
+  IDLE: 'idle',
+  ERROR: 'error',
+};
+
+function emit(onStatus, phase, detail) {
+  if (typeof onStatus === 'function') {
+    try {
+      onStatus({ phase, detail: detail ?? '', at: Date.now() });
+    } catch {
+      // Status subscribers must never break queries.
+    }
+  }
+}
+
+/// Convert an Arrow result table to plain JSON with BigInt → Number.
+function toJsonRows(arrowTable) {
+  const rows = arrowTable.toArray().map((r) => r.toJSON());
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      const v = row[key];
+      if (typeof v === 'bigint') row[key] = Number(v);
+    }
+  }
+  return rows;
+}
+
+const WorkerEngine = {
+  _db: null,
+  _conn: null,
+  _mode: 'unknown',
+  _httpfsReady: false,
+
+  get mode() {
+    return this._mode;
+  },
+
+  /// Boot the WASM runtime inside a worker thread. Idempotent.
+  async init(onStatus) {
+    if (this._db) return this._db;
+    emit(onStatus, EnginePhases.WASM_LOADING, 'downloading duckdb-wasm bundle…');
+    const bundles = duckdb.getJsDelivrBundles();
+    const bundle = await duckdb.selectBundle(bundles);
+    const workerUrl = URL.createObjectURL(
+      new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }),
+    );
+    try {
+      const worker = new Worker(workerUrl);
+      const logger = new duckdb.ConsoleLogger();
+      this._db = new duckdb.AsyncDuckDB(logger, worker);
+      await this._db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    } finally {
+      URL.revokeObjectURL(workerUrl);
+    }
+    emit(onStatus, EnginePhases.WASM_READY, 'duckdb-wasm ready');
+    return this._db;
+  },
+
+  async _connect() {
+    if (this._conn) return this._conn;
+    this._conn = await this._db.connect();
+    return this._conn;
+  },
+
+  async _tryHttpfs() {
+    if (this._httpfsReady) return;
+    const conn = await this._connect();
+    // INSTALL is a no-op when statically linked; LOAD may throw there too.
+    // Either way failure is non-fatal — the fallback path covers it.
+    try {
+      await conn.query('INSTALL httpfs');
+    } catch {
+      // ignore: bundled or offline
+    }
+    try {
+      await conn.query('LOAD httpfs');
+    } catch {
+      // ignore: statically linked builds reject LOAD
+    }
+    this._httpfsReady = true;
+  },
+
+  _viewSql(urls) {
+    const list = urls.map((u) => `'${u.replaceAll("'", "''")}'`).join(', ');
+    return `CREATE OR REPLACE VIEW metrics_all AS SELECT * FROM read_parquet([${list}], union_by_name=true)`;
+  },
+
+  /// Point `metrics_all` at remote URL(s). Tries range-requests first,
+  /// falls back to full-file fetch on any failure. Returns the access mode.
+  async ensureView(urls, onStatus) {
+    const conn = await this._connect();
+    emit(onStatus, EnginePhases.METADATA_LOADING, `reading parquet metadata (${urls.length} file(s))…`);
+    // --- Attempt 1: httpfs range-requests over the remote URL(s). ---
+    try {
+      await this._tryHttpfs();
+      await conn.query(this._viewSql(urls));
+      await conn.query('SELECT count(*) AS c FROM (SELECT * FROM metrics_all LIMIT 1)');
+      this._mode = 'httpfs-range';
+      emit(onStatus, EnginePhases.IDLE, 'metadata loaded via range requests');
+      return this._mode;
+    } catch (err) {
+      // Fall through to full download (CORS / Range / httpfs missing).
+      emit(
+        onStatus,
+        EnginePhases.METADATA_LOADING,
+        `range access failed (${err?.message ?? err}); downloading full file(s)…`,
+      );
+    }
+    // --- Attempt 2: fetch whole files into the WASM FS. ---
+    const localNames = [];
+    for (let i = 0; i < urls.length; i++) {
+      const res = await fetch(urls[i]);
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${urls[i]}`);
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const name = `remote_${i}.parquet`;
+      await this._db.registerFileBuffer(name, buf);
+      localNames.push(name);
+    }
+    await conn.query(this._viewSql(localNames));
+    this._mode = 'fetch-buffer';
+    emit(onStatus, EnginePhases.IDLE, 'parquet downloaded into browser memory');
+    return this._mode;
+  },
+
+  /// Run analytical SQL against `metrics_all`. Returns plain row objects.
+  async query(sql, onStatus, label) {
+    const conn = await this._connect();
+    emit(onStatus, EnginePhases.QUERYING, label ?? 'executing analytical query…');
+    try {
+      const arrow = await conn.query(sql);
+      const rows = toJsonRows(arrow);
+      emit(onStatus, EnginePhases.IDLE, `${rows.length} row(s)`);
+      return rows;
+    } catch (err) {
+      emit(onStatus, EnginePhases.ERROR, err?.message ?? String(err));
+      throw err;
+    }
+  },
+};
+
+
+/* ---- js/duckdb_client.js ---- */
+//! Main-thread data-source adapter: resolves a user-supplied base URL to
+//! concrete Parquet URL(s), owns the `metrics_all` view lifecycle, and
+//! turns raw query rows into dashboard-ready datasets + summary numbers.
+
+
+const num = (v) => (typeof v === 'bigint' ? Number(v) : v ?? 0);
+
+/// Normalize one throughput row (BigInt-safe).
+function normThroughputRow(r) {
+  return {
+    bucket_us: Number(r.bucket_us),
+    reqs: Number(num(r.reqs)),
+    avg_ms: r.avg_ms == null ? null : Number(r.avg_ms),
+    p99_ms: r.p99_ms == null ? null : Number(r.p99_ms),
+  };
+}
+
+function normErrorRow(r) {
+  return {
+    path: String(r.path ?? '(unknown)'),
+    c4xx: Number(num(r.c4xx)),
+    c5xx: Number(num(r.c5xx)),
+    total: Number(num(r.total)),
+  };
+}
+
+/// Try `<base>/api/files` manifest (mock-server + future backends).
+/// Returns absolute URLs or null when no manifest exists.
+async function tryManifest(base) {
+  try {
+    const url = base.replace(/\/$/, '') + '/api/files';
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) return null;
+    return data
+      .map((e) => (typeof e === 'string' ? e : e.url))
+      .filter(Boolean)
+      .map((u) => new URL(u, base).toString());
+  } catch {
+    return null;
+  }
+}
+
+const DataSource = {
+  baseUrl: '',
+  urls: [],
+  mode: 'unknown',
+
+  /// Resolve free-form user input to Parquet file URL(s).
+  /// - `…/x.parquet` → that file directly.
+  /// - otherwise → `<base>/api/files` manifest if present,
+  ///   else `<base>/telemetry/parquet` (duckmetrics file route).
+  async resolveInput(input) {
+    const trimmed = input.trim().replace(/\/$/, '');
+    if (trimmed === '') throw new Error('empty data source URL');
+    if (/\.parquet(\?.*)?$/i.test(trimmed)) return [trimmed];
+    const manifest = await tryManifest(trimmed);
+    if (manifest) return manifest;
+    return [`${trimmed}/telemetry/parquet`];
+  },
+
+  async connect(input, onStatus) {
+    await WorkerEngine.init(onStatus);
+    const urls = await this.resolveInput(input);
+    this.baseUrl = input.trim();
+    this.urls = urls;
+    this.mode = await WorkerEngine.ensureView(urls, onStatus);
+    return { urls, mode: this.mode };
+  },
+
+  async refreshAll(range, onStatus) {
+    const throughputSql = Queries.throughputLatency(range);
+    const errorsSql = Queries.errorDistribution(range);
+    const namesSql = Queries.listMetricNames();
+    const [tRows, eRows, nRows] = await Promise.all([
+      WorkerEngine.query(throughputSql, onStatus, 'aggregating throughput + latency…'),
+      WorkerEngine.query(errorsSql, onStatus, 'aggregating error distribution…'),
+      WorkerEngine.query(namesSql, onStatus, 'listing metric names…').catch(() => []),
+    ]);
+    const throughput = tRows.map(normThroughputRow);
+    const errors = eRows.map(normErrorRow);
+    const names = nRows.map((r) => String(r.name));
+    const bucketSecs = Queries.Ranges[range]?.bucketSecs ?? 3600;
+    return { throughput, errors, names, summary: this.summarize(throughput, errors, bucketSecs) };
+  },
+
+  async runCustom(opts, onStatus) {
+    const sql = Queries.customSeries(opts);
+    const rows = await WorkerEngine.query(sql, onStatus, `plotting ${opts.metric}…`);
+    return {
+      sql,
+      rows: rows.map((r) => ({
+        bucket_us: Number(r.bucket_us),
+        v: r.v == null ? null : Number(num(r.v)),
+        n: Number(num(r.n)),
+      })),
+    };
+  },
+
+  summarize(throughput, errors, bucketSecs) {
+    let total = 0;
+    let latSum = 0;
+    let latN = 0;
+    let peak = 0;
+    for (const r of throughput) {
+      total += r.reqs;
+      if (r.reqs > peak) peak = r.reqs;
+      if (r.avg_ms != null && Number.isFinite(r.avg_ms)) {
+        latSum += r.avg_ms * r.reqs;
+        latN += r.reqs;
+      }
+    }
+    let errCount = 0;
+    for (const e of errors) errCount += e.c4xx + e.c5xx;
+    return {
+      total,
+      avgMs: latN > 0 ? latSum / latN : null,
+      peakPerSec: bucketSecs > 0 ? peak / bucketSecs : peak,
+      errorRate: total > 0 ? errCount / total : 0,
+      errorCount: errCount,
+    };
+  },
+};
+
+
+/* ---- js/charts.js ---- */
+//! ECharts wrappers: dark-theme time-series + error charts with graceful
+//! empty/loading states. Expects `window.echarts` from the CDN script tag.
+//! uPlot can replace these renderers later without touching callers.
+
+const AXIS = '#8b93a7';
+const SPLIT = 'rgba(148, 163, 184, 0.14)';
+const ACCENT = '#38bdf8';
+const ACCENT2 = '#a78bfa';
+const WARN = '#fbbf24';
+const BAD = '#f87171';
+const FONT = 'Inter, system-ui, -apple-system, sans-serif';
+
+function baseOption() {
+  return {
+    backgroundColor: 'transparent',
+    textStyle: { fontFamily: FONT, color: '#e2e8f0' },
+    animationDuration: 300,
+  };
+}
+
+function emptyOption(message) {
+  return {
+    ...baseOption(),
+    graphic: {
+      elements: [
+        {
+          type: 'text',
+          left: 'center',
+          top: 'middle',
+          style: { text: message, fill: '#64748b', font: `14px ${FONT}` },
+        },
+      ],
+    },
+    xAxis: { show: false },
+    yAxis: { show: false },
+    series: [],
+  };
+}
+
+function tooltipBase(extra) {
+  return {
+    trigger: 'axis',
+    backgroundColor: '#0f172a',
+    borderColor: '#334155',
+    textStyle: { color: '#e2e8f0', fontSize: 12 },
+    ...(extra ?? {}),
+  };
+}
+
+const msOf = (bucketUs) => Math.floor(Number(bucketUs) / 1000);
+
+function available() {
+  return typeof window !== 'undefined' && typeof window.echarts !== 'undefined';
+}
+
+function getChart(el) {
+  if (!available()) {
+    el.innerHTML = '<div class="chart-fallback">chart library (CDN) failed to load</div>';
+    return null;
+  }
+  const existing = window.echarts.getInstanceByDom(el);
+  if (existing) return existing;
+  return window.echarts.init(el, null, { renderer: 'canvas' });
+}
+
+const Charts = {
+  _els: {},
+
+  init() {
+    if (!available()) return false;
+    for (const id of ['chartThroughput', 'chartLatency', 'chartErrors', 'chartCustom']) {
+      const el = document.getElementById(id);
+      if (el) {
+        this._els[id] = getChart(el);
+        this._els[id]?.setOption(emptyOption('no data yet — pick a source and refresh'));
+      }
+    }
+    window.addEventListener('resize', () => {
+      for (const c of Object.values(this._els)) c?.resize();
+    });
+    return true;
+  },
+
+  renderThroughput(rows) {
+    const chart = this._els.chartThroughput;
+    if (!chart) return;
+    if (rows.length === 0) {
+      chart.setOption(emptyOption('no request samples in range'), true);
+      return;
+    }
+    const data = rows.map((r) => [msOf(r.bucket_us), r.reqs]);
+    chart.setOption(
+      {
+        ...baseOption(),
+        tooltip: tooltipBase(),
+        grid: { left: 56, right: 16, top: 28, bottom: 30 },
+        xAxis: {
+          type: 'time',
+          axisLine: { lineStyle: { color: SPLIT } },
+          axisLabel: { color: AXIS },
+        },
+        yAxis: {
+          type: 'value',
+          name: 'reqs/bucket',
+          nameTextStyle: { color: AXIS },
+          splitLine: { lineStyle: { color: SPLIT } },
+          axisLabel: { color: AXIS },
+        },
+        series: [
+          {
+            name: 'requests',
+            type: 'line',
+            showSymbol: false,
+            sampling: 'lttb',
+            smooth: 0.15,
+            data,
+            lineStyle: { width: 2, color: ACCENT },
+            areaStyle: { color: 'rgba(56, 189, 248, 0.12)' },
+          },
+        ],
+      },
+      true,
+    );
+  },
+
+  renderLatency(rows) {
+    const chart = this._els.chartLatency;
+    if (!chart) return;
+    if (rows.length === 0 || rows.every((r) => r.avg_ms == null)) {
+      chart.setOption(emptyOption('no latency samples in range'), true);
+      return;
+    }
+    const avg = rows.filter((r) => r.avg_ms != null).map((r) => [msOf(r.bucket_us), +r.avg_ms.toFixed(2)]);
+    const p99 = rows.filter((r) => r.p99_ms != null).map((r) => [msOf(r.bucket_us), +r.p99_ms.toFixed(2)]);
+    chart.setOption(
+      {
+        ...baseOption(),
+        tooltip: tooltipBase({ valueFormatter: (v) => `${v} ms` }),
+        legend: { textStyle: { color: AXIS }, top: 0 },
+        grid: { left: 56, right: 16, top: 36, bottom: 30 },
+        xAxis: { type: 'time', axisLabel: { color: AXIS } },
+        yAxis: {
+          type: 'value',
+          name: 'ms',
+          nameTextStyle: { color: AXIS },
+          splitLine: { lineStyle: { color: SPLIT } },
+          axisLabel: { color: AXIS },
+        },
+        series: [
+          {
+            name: 'avg latency',
+            type: 'line',
+            showSymbol: false,
+            sampling: 'lttb',
+            smooth: 0.15,
+            data: avg,
+            lineStyle: { width: 2, color: ACCENT2 },
+          },
+          {
+            name: 'p99',
+            type: 'line',
+            showSymbol: false,
+            sampling: 'lttb',
+            data: p99,
+            lineStyle: { width: 1.5, type: 'dashed', color: WARN },
+          },
+        ],
+      },
+      true,
+    );
+  },
+
+  renderErrors(rows) {
+    const chart = this._els.chartErrors;
+    if (!chart) return;
+    if (rows.length === 0) {
+      chart.setOption(emptyOption('no 4xx/5xx in range — healthy'), true);
+      return;
+    }
+    const paths = rows.map((r) => r.path);
+    chart.setOption(
+      {
+        ...baseOption(),
+        tooltip: tooltipBase({ trigger: 'axis', axisPointer: { type: 'shadow' } }),
+        legend: { textStyle: { color: AXIS }, top: 0 },
+        grid: { left: 8, right: 48, top: 36, bottom: 8, containLabel: true },
+        xAxis: {
+          type: 'value',
+          splitLine: { lineStyle: { color: SPLIT } },
+          axisLabel: { color: AXIS },
+        },
+        yAxis: { type: 'category', data: paths, axisLabel: { color: AXIS } },
+        series: [
+          {
+            name: '4xx',
+            type: 'bar',
+            stack: 'err',
+            data: rows.map((r) => r.c4xx),
+            itemStyle: { color: WARN },
+            label: { show: false },
+          },
+          {
+            name: '5xx',
+            type: 'bar',
+            stack: 'err',
+            data: rows.map((r) => r.c5xx),
+            itemStyle: { color: BAD },
+          },
+        ],
+      },
+      true,
+    );
+  },
+
+  renderCustom(rows, metric, agg) {
+    const chart = this._els.chartCustom;
+    if (!chart) return;
+    if (rows.length === 0) {
+      chart.setOption(emptyOption(`no samples for ${metric}`), true);
+      return;
+    }
+    const data = rows.map((r) => [msOf(r.bucket_us), r.v]);
+    chart.setOption(
+      {
+        ...baseOption(),
+        tooltip: tooltipBase(),
+        grid: { left: 56, right: 16, top: 28, bottom: 30 },
+        xAxis: { type: 'time', axisLabel: { color: AXIS } },
+        yAxis: {
+          type: 'value',
+          splitLine: { lineStyle: { color: SPLIT } },
+          axisLabel: { color: AXIS },
+        },
+        series: [
+          {
+            name: `${metric} (${agg})`,
+            type: 'line',
+            showSymbol: false,
+            sampling: 'lttb',
+            smooth: 0.15,
+            data,
+            lineStyle: { width: 2, color: '#34d399' },
+            areaStyle: { color: 'rgba(52, 211, 153, 0.10)' },
+          },
+        ],
+      },
+      true,
+    );
+  },
+};
+
+
+/* ---- js/components/cards.js ---- */
+//! Summary cards: Total Requests, Avg Latency, Peak Throughput, Error Rate.
+
+const fmtInt = new Intl.NumberFormat('en-US');
+const fmtPct = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 2 });
+
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+const Cards = {
+  render(summary, mode) {
+    setText('statTotal', fmtInt.format(summary.total));
+    setText('statAvg', summary.avgMs == null ? '—' : `${summary.avgMs.toFixed(1)} ms`);
+    setText(
+      'statPeak',
+      summary.peakPerSec >= 10
+        ? `${summary.peakPerSec.toFixed(0)} rps`
+        : `${summary.peakPerSec.toFixed(2)} rps`,
+    );
+    setText(
+      'statErr',
+      summary.total === 0 ? '—' : `${fmtPct.format(summary.errorRate)} (${fmtInt.format(summary.errorCount)})`,
+    );
+    setText('modeBadge', mode === 'unknown' ? 'not connected' : `via ${mode}`);
+  },
+
+  reset() {
+    this.render({ total: 0, avgMs: null, peakPerSec: 0, errorRate: 0, errorCount: 0 }, 'unknown');
+  },
+};
+
+
+/* ---- js/components/controls.js ---- */
+//! Form controls: data-source input, range dropdown, custom visualizer.
+//! Persists source + range to localStorage.
+
+const LS_SOURCE = 'dm:baseUrl';
+const LS_RANGE = 'dm:range';
+
+function val(id) {
+  return document.getElementById(id)?.value ?? '';
+}
+
+const Controls = {
+  onRefresh: null,
+  onCustom: null,
+
+  init({ onRefresh, onCustom }) {
+    this.onRefresh = onRefresh;
+    this.onCustom = onCustom;
+
+    document.getElementById('srcGo')?.addEventListener('click', () => this.handleRefresh(true));
+    document.getElementById('srcInput')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') this.handleRefresh(true);
+    });
+    document.getElementById('rangeSelect')?.addEventListener('change', () => this.handleRefresh(false));
+    document.getElementById('refreshBtn')?.addEventListener('click', () => this.handleRefresh(false));
+    document.getElementById('customRun')?.addEventListener('click', () => onCustom?.());
+  },
+
+  loadPersisted() {
+    const src = document.getElementById('srcInput');
+    const range = document.getElementById('rangeSelect');
+    try {
+      const s = localStorage.getItem(LS_SOURCE);
+      if (s && src) src.value = s;
+      const r = localStorage.getItem(LS_RANGE);
+      if (r && range && ['1h', '24h', 'all'].includes(r)) range.value = r;
+    } catch {
+      // private mode: ignore
+    }
+  },
+
+  persist() {
+    try {
+      localStorage.setItem(LS_SOURCE, val('srcInput').trim());
+      localStorage.setItem(LS_RANGE, val('rangeSelect'));
+    } catch {
+      // ignore
+    }
+  },
+
+  handleRefresh(reconnect) {
+    this.persist();
+    this.onRefresh?.({ reconnect });
+  },
+
+  getSource() {
+    return val('srcInput').trim();
+  },
+
+  getRange() {
+    const r = val('rangeSelect');
+    return ['1h', '24h', 'all'].includes(r) ? r : '24h';
+  },
+
+  getCustom() {
+    return {
+      metric: val('metricSelect').trim() || 'http_request_duration_ms',
+      agg: val('aggSelect').trim() || 'avg',
+      labelKey: val('labelKey').trim(),
+      labelValue: val('labelValue').trim(),
+      range: this.getRange(),
+    };
+  },
+
+  setNames(names) {
+    const sel = document.getElementById('metricSelect');
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '';
+    const list = names.length > 0 ? names : ['http_requests_total', 'http_request_duration_ms'];
+    for (const n of list) {
+      const opt = document.createElement('option');
+      opt.value = n;
+      opt.textContent = n;
+      sel.appendChild(opt);
+    }
+    if (list.includes(prev)) sel.value = prev;
+    else if (list.includes('http_request_duration_ms')) sel.value = 'http_request_duration_ms';
+  },
+
+  setSql(text) {
+    const el = document.getElementById('sqlPreview');
+    if (el) el.textContent = text;
+  },
+};
+
+
+/* ---- js/app.js ---- */
+//! App boot: wires engine status → UI, controls → queries → charts.
+//! All DuckDB execution happens in the WASM worker thread; this module
+//! only orchestrates state and rendering on the main thread.
+
+
+function setStatus(phase, detail) {
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  if (text) text.textContent = detail || phase;
+  if (dot) {
+    dot.dataset.phase = phase;
+    dot.title = phase;
+  }
+  document.getElementById('main')?.classList.toggle('loading', phase === 'querying' || phase === 'metadata-loading');
+}
+
+function showError(message) {
+  const banner = document.getElementById('errorBanner');
+  if (!banner) return;
+  if (!message) {
+    banner.classList.add('hidden');
+    banner.textContent = '';
+    return;
+  }
+  banner.classList.remove('hidden');
+  banner.textContent = message;
+}
+
+function corsHint(url) {
+  let host = url;
+  try {
+    host = new URL(url).origin;
+  } catch {
+    // keep raw
+  }
+  return (
+    ` — if the file exists, this is usually CORS or Range support. ` +
+    `The backend must reply with Access-Control-Allow-Origin:* and Accept-Ranges:bytes ` +
+    `(check: curl -I ${host}/telemetry/parquet). ` +
+    `Same-origin deployments and the mock server (npm run mock-server) work out of the box.`
+  );
+}
+
+let connectedUrl = '';
+let refreshing = false;
+
+async function refresh({ reconnect }) {
+  if (refreshing) return;
+  refreshing = true;
+  showError('');
+  try {
+    const source = Controls.getSource();
+    const range = Controls.getRange();
+    if (reconnect || connectedUrl !== source) {
+      setStatus('metadata-loading', `connecting to ${source}…`);
+      await DataSource.connect(source, setStatusCb);
+      connectedUrl = source;
+    }
+    const data = await DataSource.refreshAll(range, setStatusCb);
+    Cards.render(data.summary, DataSource.mode);
+    Charts.renderThroughput(data.throughput);
+    Charts.renderLatency(data.throughput);
+    Charts.renderErrors(data.errors);
+    Controls.setNames(data.names);
+    Controls.setSql(Queries.throughputLatency(range));
+  } catch (err) {
+    const msg = err?.message ?? String(err);
+    const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);
+    showError(`query failed: ${msg}${isHttp ? corsHint(Controls.getSource()) : ''}`);
+    setStatus('error', msg);
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function runCustom() {
+  showError('');
+  try {
+    const opts = Controls.getCustom();
+    const { sql, rows } = await DataSource.runCustom(opts, setStatusCb);
+    Charts.renderCustom(rows, opts.metric, opts.agg);
+    Controls.setSql(sql);
+  } catch (err) {
+    showError(`custom query failed: ${err?.message ?? err}`);
+  }
+}
+
+function setStatusCb({ phase, detail }) {
+  setStatus(phase, detail);
+}
+
+function boot() {
+  if (window.lucide?.createIcons) window.lucide.createIcons();
+  Cards.reset();
+  Charts.init();
+  Controls.init({ onRefresh: refresh, onCustom: runCustom });
+  Controls.loadPersisted();
+  if (!Controls.getSource()) {
+    document.getElementById('srcInput').value = 'http://localhost:3000';
+  }
+  setStatus('idle', 'initializing…');
+  // Engine warms up in the background; first refresh connects on demand.
+  WorkerEngine.init(setStatusCb)
+    .then(() => refresh({ reconnect: true }))
+    .catch((err) => {
+      showError(`wasm init failed: ${err?.message ?? err}`);
+      setStatus('error', 'wasm init failed');
+    });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', boot);
+} else {
+  boot();
+}
+
+</script>
+</body>
+</html>

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tonggeret-dashboard — client-side telemetry</title>
+  <meta
+    name="description"
+    content="Zero-server-query dashboard for tonggeret Fjall/Parquet exports. DuckDB-Wasm in your browser queries remote Parquet over HTTP."
+  />
+  <link rel="stylesheet" href="css/styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "@duckdb/duckdb-wasm": "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm",
+        "apache-arrow": "https://cdn.jsdelivr.net/npm/apache-arrow@16.1.0/+esm"
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <i data-lucide="activity" class="brand-icon"></i>
+      <div>
+        <h1>tonggeret-dashboard</h1>
+        <p class="subtitle">browser-side analytics over <code>/telemetry/parquet</code></p>
+      </div>
+    </div>
+    <div class="controls-bar">
+      <label class="src-label" for="srcInput">
+        <i data-lucide="database"></i>
+        <input
+          id="srcInput"
+          type="url"
+          size="34"
+          spellcheck="false"
+          placeholder="http://localhost:3000  or  https://host/path.parquet"
+          value="http://localhost:3000"
+        />
+      </label>
+      <button id="srcGo" class="btn primary" title="Connect to this source">
+        <i data-lucide="plug-zap"></i>Connect
+      </button>
+      <label class="range-label" for="rangeSelect">
+        <i data-lucide="calendar-range"></i>
+        <select id="rangeSelect">
+          <option value="1h">Last 1 Hour</option>
+          <option value="24h" selected>Last 24 Hours</option>
+          <option value="all">All Time</option>
+        </select>
+      </label>
+      <button id="refreshBtn" class="btn" title="Re-run all queries">
+        <i data-lucide="refresh-cw"></i>Refresh
+      </button>
+      <span class="status" title="engine status">
+        <span id="statusDot" class="dot" data-phase="idle"></span>
+        <span id="statusText">initializing…</span>
+      </span>
+    </div>
+  </header>
+
+  <div id="errorBanner" class="banner hidden" role="alert"></div>
+
+  <main id="main" class="layout">
+    <section class="cards" aria-label="summary">
+      <article class="stat-card">
+        <header><i data-lucide="hash"></i>Total Requests</header>
+        <div id="statTotal" class="stat-value">—</div>
+      </article>
+      <article class="stat-card">
+        <header><i data-lucide="timer"></i>Avg Latency</header>
+        <div id="statAvg" class="stat-value">—</div>
+      </article>
+      <article class="stat-card">
+        <header><i data-lucide="gauge"></i>Peak Throughput</header>
+        <div id="statPeak" class="stat-value">—</div>
+      </article>
+      <article class="stat-card">
+        <header><i data-lucide="triangle-alert"></i>Error Rate</header>
+        <div id="statErr" class="stat-value">—</div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="chart-line"></i>Request throughput</h2>
+        <span id="modeBadge" class="badge">not connected</span>
+      </header>
+      <div id="chartThroughput" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="chart-spline"></i>Latency: average &amp; p99 (ms)</h2>
+      </header>
+      <div id="chartLatency" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="chart-column"></i>Error distribution by path (4xx / 5xx)</h2>
+      </header>
+      <div id="chartErrors" class="chart"></div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2><i data-lucide="sliders-horizontal"></i>Custom metric visualizer</h2>
+      </header>
+      <div class="custom-form">
+        <label>Metric
+          <select id="metricSelect">
+            <option>http_request_duration_ms</option>
+          </select>
+        </label>
+        <label>Aggregation
+          <select id="aggSelect">
+            <option value="avg" selected>avg</option>
+            <option value="p50">p50</option>
+            <option value="p99">p99</option>
+            <option value="sum">sum</option>
+            <option value="count">count</option>
+            <option value="min">min</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label>Label key
+          <input id="labelKey" placeholder="e.g. path" size="12" />
+        </label>
+        <label>Label value
+          <input id="labelValue" placeholder="e.g. /orders" size="12" />
+        </label>
+        <button id="customRun" class="btn primary"><i data-lucide="play"></i>Plot</button>
+      </div>
+      <div id="chartCustom" class="chart"></div>
+      <details class="sql-details">
+        <summary>Generated SQL</summary>
+        <pre id="sqlPreview">-- run a query to preview the SQL here</pre>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>100% client-side: DuckDB-Wasm queries <code>/telemetry/parquet</code> with HTTP range requests; no server query code.</span>
+    <span>Serve with <code>npm run mock-server</code> for isolated development.</span>
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

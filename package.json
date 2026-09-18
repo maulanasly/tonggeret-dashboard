@@ -1,0 +1,16 @@
+{
+  "name": "tonggeret-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent client-side dashboard for tonggeret Fjall/Parquet exports. Zero server-side query code: DuckDB-Wasm in the browser queries remote Parquet over HTTP.",
+  "scripts": {
+    "dev": "node scripts/mock-server.mjs --port 8080",
+    "mock-server": "node scripts/mock-server.mjs --port 8080",
+    "gen-mock": "node scripts/generate-mock-parquet.mjs",
+    "build": "node scripts/build-singlefile.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
