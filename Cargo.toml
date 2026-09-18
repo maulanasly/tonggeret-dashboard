@@ -1,0 +1,43 @@
+[package]
+name = "tonggeret-dashboard"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Prometheus scrape collector (Fjall hot store + Parquet history) with embedded DuckDB-Wasm dashboard"
+repository = "https://github.com/maulanasly/tonggeret-dashboard"
+default-run = "collector"
+
+[[bin]]
+name = "collector"
+path = "src/main.rs"
+
+[dependencies]
+tonggeret = { version = "0.2", features = ["fjall-backend"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+prometheus-parse = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

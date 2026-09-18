@@ -1,10 +1,63 @@
 # tonggeret-dashboard
 
-Independent, client-side dashboard for [`tonggeret`](https://github.com/maulanasly/tonggeret) Fjall/Parquet exports.
+Scrape collector + history + graphs for [`tonggeret`](https://github.com/maulanasly/tonggeret)
+apps. One Rust binary scrapes any Prometheus `/metrics` targets on an
+interval, stores samples in embedded Fjall (<10 MiB RAM), compacts 30 days
+of history to Parquet, and serves a client-side dashboard (**DuckDB-Wasm
+runs in a Web Worker inside your browser** and queries the cold Parquet
+over HTTP range requests).
+
+## Quickstart (collector)
+
+```sh
+cargo run -- collector.toml   # scrapes beruang :8000 → :8080
+# open http://localhost:8080/ — graphs read this collector's own history
+```
+
+`collector.toml`: targets (`name`/`url`/`allow` prefixes), `interval_secs`,
+`listen`, `static_dir`, `max_samples_per_scrape`, `max_body_bytes`,
+`[fjall]` (`dir`, `cold_dir`, `retention_days = 30`,
+`cold_purge_days = 32`). Env overrides: `COLLECTOR_LISTEN`,
+`COLLECTOR_FJALL_DIR`.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/` | prebuilt UI bundle (`dist/`) |
+| GET | `/metrics` | collector + mirrored scraped series (Prometheus text) |
+| GET | `/telemetry/parquet` | newest cold export (Range-capable) |
+| GET | `/telemetry/cold/:file` | named cold export, allowlisted to `metrics_cold_*.parquet` |
+| GET | `/api/files` | JSON manifest of cold files (auto-used by the UI) |
+
+## Series catalog
+
+Every stored sample gains a `scrape_target` label (closed set from
+config). Gauges stay gauges, everything else is stored as counters;
+histogram/summary families are stored as cumulative `*_bucket{le}` /
+`*`+`quantile` component counters. Visitor metrics are optional:
+`visitors_total{region}` (counter) + `unique_visitors_estimate{region}`
+(gauge) flow through the same mapping — apps without them (e.g. beruang
+today) store zero visitor rows, no error. Never `sum()` the uniques
+estimate; take latest per `(target, region)`.
+
+Self series: `collector_scrape_total{target,status}`,
+`collector_samples_stored_total{target}`,
+`collector_samples_dropped_total{target,reason}`.
+
+## Retention ops
+
+Hot keys older than `retention_days` compact to hourly
+`metrics_cold_*.parquet`; cold files older than `cold_purge_days` are
+deleted (must exceed retention). Raw disk ≈ targets × series ×
+scrapes/min × ~100 B/day pre-ZSTD — size `data/` for your fleet and back
+it up if history matters; `data/` is gitignored and never committed.
+
+## Dashboard (UI dev, no collector)
+
+Independent, client-side dashboard for tonggeret Fjall/Parquet exports.
 Zero server-side query code: **DuckDB-Wasm runs in a Web Worker inside your browser**
 and queries remote Parquet files over HTTP (range requests when the server allows it).
 
-## Quickstart
+### UI quickstart
 
 ```sh
 cd apps/tonggeret-dashboard

@@ -1,0 +1,37 @@
+# tonggeret-dashboard collector config.
+#
+# Copy to your deploy dir and point `--config` at it. Env overrides:
+# `COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`.
+
+# Seconds between scrape passes (targets scraped sequentially).
+interval_secs = 15
+# Serve address for the dashboard + /metrics + /telemetry/parquet + /api/files.
+listen = "0.0.0.0:8080"
+# Prebuilt UI bundle served at `/`.
+static_dir = "dist"
+# Per-target sample cap per scrape (overflow counted, scrape continues).
+max_samples_per_scrape = 5000
+# Largest accepted exposition body in bytes.
+max_body_bytes = 1048576
+
+[fjall]
+dir = "./data/fjall"
+cold_dir = "./data/cold"
+# Hot age after which keys compact to Parquet (dashboard history depth).
+retention_days = 30
+# Cold files older than this are purged (must exceed retention_days).
+cold_purge_days = 32
+
+[[targets]]
+name = "beruang"
+url = "http://localhost:8000/metrics"
+# Series-name prefixes accepted from this target. Visitor series
+# (`visitors_total`, `unique_visitors_estimate`) are covered by the
+# `visitors_`/`unique_` entries: an app without them scrapes fine,
+# it simply stores zero visitor rows.
+allow = ["http_", "beruang_", "tonggeret_", "collector_", "visitors_", "unique_"]
+
+# [[targets]]
+# name = "example"
+# url = "http://localhost:3000/metrics"
+# allow = ["http_", "tonggeret_", "orders_total", "greetings_total", "db_query_ms", "visitors_", "unique_"]

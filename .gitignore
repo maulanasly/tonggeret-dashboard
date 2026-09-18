@@ -1,3 +1,8 @@
 node_modules/
 .DS_Store
 scripts/.gen.sql.tmp
+# Rust collector build + local hot/cold state (never commit telemetry data).
+/target/
+(data|data-*)/
+*.db
+*.db.wal
