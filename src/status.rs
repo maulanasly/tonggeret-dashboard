@@ -53,6 +53,8 @@ pub struct QueueInfo {
     pub cap: usize,
     /// True when manual jobs are held.
     pub paused: bool,
+    /// True when the whole executor is frozen (nothing runs).
+    pub frozen: bool,
     /// Name of the currently running job's target, if any.
     pub running: Option<String>,
     /// Lifetime completed jobs.
@@ -283,6 +285,7 @@ mod tests {
             depth: 0,
             cap: 256,
             paused: false,
+            frozen: false,
             running: None,
             done: 0,
             failed: 0,

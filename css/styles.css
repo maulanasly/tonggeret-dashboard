@@ -93,6 +93,36 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .btn.tiny { padding: 2px 8px; font-size: 0.72rem; }
 .btn.danger { color: var(--bad); border-color: #7f1d1d; }
 .btn.danger:hover { border-color: var(--bad); }
+.btn.ghost { color: var(--muted); }
+.btn[data-state="frozen"] { color: #7dd3fc; border-color: #0284c7; background: #082f49; }
+
+.chip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+}
+.chip svg { width: 14px; height: 14px; }
+.chip[data-status="ok"] { color: var(--good); border-color: var(--good); }
+.chip[data-status="starting"] { color: #60a5fa; border-color: #60a5fa; }
+.chip[data-status="degraded"] { color: #f59e0b; border-color: #f59e0b; }
+.chip[data-status="frozen"] { color: #7dd3fc; border-color: #0284c7; }
+.chip[data-status="offline"] { color: var(--bad); border-color: var(--bad); }
+
+.advanced-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 8px 20px 0;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.advanced-hint { color: var(--muted); font-size: 0.74rem; }
 
 .targets-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
 .targets-form label { display: grid; gap: 4px; font-size: 0.78rem; color: var(--muted); }

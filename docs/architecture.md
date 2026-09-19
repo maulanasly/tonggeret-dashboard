@@ -73,6 +73,8 @@ scrape targets (/metrics) ──15s──▶ collector ──store──▶ Fjal
 | GET/POST/DELETE | `/api/v1/queue` | queue snapshot / enqueue once jobs / clear pending | worker |
 | POST | `/api/v1/queue/pause\|resume` | hold/release manual jobs | worker |
 | DELETE | `/api/v1/queue/{id}` | cancel one pending job | worker |
+| GET | `/api/v1/worker` | worker-wide control state (`frozen`) | worker |
+| POST | `/api/v1/worker/freeze\|resume` | freeze/unfreeze the executor (all scraping) | worker |
 
 Mutating control endpoints require `x-control-token` when
 `control_token` / `COLLECTOR_CONTROL_TOKEN` is set; the dashboard `serve`
@@ -359,6 +361,21 @@ or `cancelled`. Lifetime `done`/`failed` counters and the running job appear
 in `GET /api/v1/status`; `GET /api/v1/queue` returns the full snapshot for
 the panel. The queue is in-memory only — a restart clears pending jobs while
 persisted targets reload.
+
+**Pause vs freeze.** `queue/pause` holds only manual jobs (recurring keeps
+sweeping). `worker/freeze` is a superset: `pop_next` returns `None` and the
+tick stops enqueuing, so nothing scrapes at all until `worker/resume`. Both
+are in-memory (process lifetime); the API stays up while frozen so the
+worker can be unfrozen.
+
+### Frozen connection + top bar
+
+The dashboard auto-binds to the origin that served it (`window.location.origin`)
+— there is no source input by default. The top bar shows a connection chip
+(`ok|starting|degraded|frozen|offline`) and a Freeze/Unfreeze toggle backed by
+`worker/freeze|resume`. The **Advanced** toggle reveals the old source input
+for static hosting that points at a remote Parquet host; when non-empty it
+overrides the same-origin default.
 
 ### Control token
 

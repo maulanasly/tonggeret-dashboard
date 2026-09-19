@@ -14,6 +14,8 @@ export const TargetsClient = {
   token: '',
   timer: null,
   wired: false,
+  /// Latest worker-wide freeze state (from the queue snapshot).
+  frozen: false,
 
   /// Wire the form/buttons once and restore the optional control token.
   init() {
@@ -53,6 +55,7 @@ export const TargetsClient = {
   /// Badge text/status for the current queue snapshot.
   queueBadge(queue) {
     if (!queue) return { text: 'offline', status: 'offline' };
+    if (queue.frozen) return { text: `frozen · ${queue.depth} queued`, status: 'frozen' };
     if (queue.paused) return { text: `paused · ${queue.depth} queued`, status: 'degraded' };
     if (queue.depth > 0) return { text: `running · ${queue.depth} queued`, status: 'starting' };
     return { text: 'queue idle', status: 'ok' };
@@ -179,6 +182,16 @@ export const TargetsClient = {
     return this.api('/api/v1/queue/resume', { method: 'POST' });
   },
 
+  /// Worker-wide freeze: halt all scraping (scheduled + manual).
+  freezeWorker() {
+    return this.api('/api/v1/worker/freeze', { method: 'POST' });
+  },
+
+  /// Lift the worker freeze and let pending work drain.
+  resumeWorker() {
+    return this.api('/api/v1/worker/resume', { method: 'POST' });
+  },
+
   clearPending() {
     return this.api('/api/v1/queue', { method: 'DELETE' });
   },
@@ -207,6 +220,7 @@ export const TargetsClient = {
       this.api('/api/v1/targets').catch(() => null),
       this.api('/api/v1/queue').catch(() => null),
     ]);
+    this.frozen = Boolean(queue?.frozen);
     this.renderTargets(targets?.targets ?? null);
     this.renderQueue(queue);
   },

@@ -104,6 +104,36 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .btn.tiny { padding: 2px 8px; font-size: 0.72rem; }
 .btn.danger { color: var(--bad); border-color: #7f1d1d; }
 .btn.danger:hover { border-color: var(--bad); }
+.btn.ghost { color: var(--muted); }
+.btn[data-state="frozen"] { color: #7dd3fc; border-color: #0284c7; background: #082f49; }
+
+.chip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+}
+.chip svg { width: 14px; height: 14px; }
+.chip[data-status="ok"] { color: var(--good); border-color: var(--good); }
+.chip[data-status="starting"] { color: #60a5fa; border-color: #60a5fa; }
+.chip[data-status="degraded"] { color: #f59e0b; border-color: #f59e0b; }
+.chip[data-status="frozen"] { color: #7dd3fc; border-color: #0284c7; }
+.chip[data-status="offline"] { color: var(--bad); border-color: var(--bad); }
+
+.advanced-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 8px 20px 0;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.advanced-hint { color: var(--muted); font-size: 0.74rem; }
 
 .targets-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
 .targets-form label { display: grid; gap: 4px; font-size: 0.78rem; color: var(--muted); }
@@ -305,19 +335,13 @@ input:focus-visible, select:focus-visible, button:focus-visible {
       </div>
     </div>
     <div class="controls-bar">
-      <label class="src-label" for="srcInput">
-        <i data-lucide="database"></i>
-        <input
-          id="srcInput"
-          type="url"
-          size="34"
-          spellcheck="false"
-          placeholder="http://localhost:3000  or  https://host/path.parquet"
-          value="http://localhost:3000"
-        />
-      </label>
-      <button id="srcGo" class="btn primary" title="Connect to this source">
-        <i data-lucide="plug-zap"></i>Connect
+      <span id="connChip" class="chip" data-status="offline" title="collector / worker connection">
+        <i data-lucide="plug"></i>
+        <span id="connChipText">offline</span>
+      </span>
+      <button id="freezeBtn" class="btn" data-state="running" title="Freeze the worker (stop all scraping)">
+        <i data-lucide="snowflake"></i>
+        <span id="freezeLabel">Freeze</span>
       </button>
       <label class="range-label" for="rangeSelect">
         <i data-lucide="calendar-range"></i>
@@ -334,6 +358,25 @@ input:focus-visible, select:focus-visible, button:focus-visible {
         <span id="statusDot" class="dot" data-phase="idle"></span>
         <span id="statusText">initializing…</span>
       </span>
+      <button id="advancedBtn" class="btn ghost" title="Advanced: point at another source">
+        <i data-lucide="settings-2"></i>Advanced
+      </button>
+    </div>
+    <div id="advancedBar" class="advanced-bar hidden">
+      <label class="src-label" for="srcInput">
+        <i data-lucide="database"></i>
+        <input
+          id="srcInput"
+          type="url"
+          size="34"
+          spellcheck="false"
+          placeholder="https://host:8080  or  https://host/path.parquet"
+        />
+      </label>
+      <button id="srcGo" class="btn primary" title="Connect to this source">
+        <i data-lucide="plug-zap"></i>Connect
+      </button>
+      <span class="advanced-hint">Leave empty to use this page's own collector.</span>
     </div>
   </header>
 
@@ -1302,12 +1345,16 @@ const STATUS_POLL_MS = 15000;
 const StatusClient = {
   baseUrl: '',
   timer: null,
+  /// Optional callback invoked with each normalized snapshot (e.g. to sync
+  /// the freeze toggle state).
+  onSnapshot: null,
 
   /// Normalize either a worker snapshot or an offline body into one shape.
   normalize(raw) {
     const targets = Array.isArray(raw?.targets) ? raw.targets : [];
     return {
       status: typeof raw?.status === 'string' ? raw.status : 'offline',
+      frozen: Boolean(raw?.queue?.frozen),
       uptimeSecs: Number(raw?.uptime_secs ?? 0),
       intervalSecs: Number(raw?.interval_secs ?? 0),
       bufferSamples: Number(raw?.buffer?.samples ?? 0),
@@ -1368,6 +1415,7 @@ const StatusClient = {
     this.baseUrl = String(baseUrl ?? '').trim().replace(/\/$/, '');
     const tick = async () => {
       const snapshot = this.normalize(await this.fetchSnapshot(this.baseUrl));
+      this.onSnapshot?.(snapshot);
       this.render(snapshot);
     };
     tick();
@@ -1381,7 +1429,15 @@ const StatusClient = {
     }
   },
 
-  /// Render a normalized snapshot into `#collectorBadge` + `#collectorStatus`.
+  /// Fetch + render one snapshot immediately (e.g. after freeze/resume).
+  async refreshNow() {
+    const snapshot = this.normalize(await this.fetchSnapshot(this.baseUrl));
+    this.onSnapshot?.(snapshot);
+    this.render(snapshot);
+  },
+
+  /// Render a normalized snapshot into `#collectorBadge` + `#collectorStatus`
+  /// and the top `#connChip`.
   render(snapshot) {
     const badge = document.getElementById('collectorBadge');
     const body = document.getElementById('collectorStatus');
@@ -1390,6 +1446,13 @@ const StatusClient = {
       badge.textContent = snapshot.status;
       badge.dataset.status = snapshot.status;
     }
+    // Top connection chip: offline > frozen > overall status.
+    const chip = document.getElementById('connChip');
+    const chipText = document.getElementById('connChipText');
+    const chipStatus =
+      snapshot.status === 'offline' ? 'offline' : snapshot.frozen ? 'frozen' : snapshot.status;
+    if (chip) chip.dataset.status = chipStatus;
+    if (chipText) chipText.textContent = chipStatus;
     const esc = (s) =>
       String(s).replace(
         /[&<>"']/g,
@@ -1447,6 +1510,8 @@ const TargetsClient = {
   token: '',
   timer: null,
   wired: false,
+  /// Latest worker-wide freeze state (from the queue snapshot).
+  frozen: false,
 
   /// Wire the form/buttons once and restore the optional control token.
   init() {
@@ -1486,6 +1551,7 @@ const TargetsClient = {
   /// Badge text/status for the current queue snapshot.
   queueBadge(queue) {
     if (!queue) return { text: 'offline', status: 'offline' };
+    if (queue.frozen) return { text: `frozen · ${queue.depth} queued`, status: 'frozen' };
     if (queue.paused) return { text: `paused · ${queue.depth} queued`, status: 'degraded' };
     if (queue.depth > 0) return { text: `running · ${queue.depth} queued`, status: 'starting' };
     return { text: 'queue idle', status: 'ok' };
@@ -1612,6 +1678,16 @@ const TargetsClient = {
     return this.api('/api/v1/queue/resume', { method: 'POST' });
   },
 
+  /// Worker-wide freeze: halt all scraping (scheduled + manual).
+  freezeWorker() {
+    return this.api('/api/v1/worker/freeze', { method: 'POST' });
+  },
+
+  /// Lift the worker freeze and let pending work drain.
+  resumeWorker() {
+    return this.api('/api/v1/worker/resume', { method: 'POST' });
+  },
+
   clearPending() {
     return this.api('/api/v1/queue', { method: 'DELETE' });
   },
@@ -1640,6 +1716,7 @@ const TargetsClient = {
       this.api('/api/v1/targets').catch(() => null),
       this.api('/api/v1/queue').catch(() => null),
     ]);
+    this.frozen = Boolean(queue?.frozen);
     this.renderTargets(targets?.targets ?? null);
     this.renderQueue(queue);
   },
@@ -2092,11 +2169,17 @@ const Cards = {
 
 
 /* ---- js/components/controls.js ---- */
-//! Form controls: data-source input, range dropdown, custom visualizer.
-//! Persists source + range to localStorage.
+//! Form controls: range dropdown, worker freeze toggle, advanced data-source
+//! override, and the custom visualizer. Persists source/range/advanced to
+//! localStorage.
+//!
+//! The connection is frozen to this page's own collector by default; the
+//! source input lives behind the **Advanced** toggle for static hosting that
+//! points at a remote Parquet host.
 
 const LS_SOURCE = 'dm:baseUrl';
 const LS_RANGE = 'dm:range';
+const LS_ADVANCED = 'dm:advanced';
 
 function val(id) {
   return document.getElementById(id)?.value ?? '';
@@ -2105,10 +2188,12 @@ function val(id) {
 const Controls = {
   onRefresh: null,
   onCustom: null,
+  onFreeze: null,
 
-  init({ onRefresh, onCustom }) {
+  init({ onRefresh, onCustom, onFreeze }) {
     this.onRefresh = onRefresh;
     this.onCustom = onCustom;
+    this.onFreeze = onFreeze;
 
     document.getElementById('srcGo')?.addEventListener('click', () => this.handleRefresh(true));
     document.getElementById('srcInput')?.addEventListener('keydown', (e) => {
@@ -2117,6 +2202,8 @@ const Controls = {
     document.getElementById('rangeSelect')?.addEventListener('change', () => this.handleRefresh(false));
     document.getElementById('refreshBtn')?.addEventListener('click', () => this.handleRefresh(false));
     document.getElementById('customRun')?.addEventListener('click', () => onCustom?.());
+    document.getElementById('freezeBtn')?.addEventListener('click', () => onFreeze?.());
+    document.getElementById('advancedBtn')?.addEventListener('click', () => this.toggleAdvanced());
   },
 
   loadPersisted() {
@@ -2127,6 +2214,7 @@ const Controls = {
       if (s && src) src.value = s;
       const r = localStorage.getItem(LS_RANGE);
       if (r && range && ['1h', '24h', 'all'].includes(r)) range.value = r;
+      if (localStorage.getItem(LS_ADVANCED) === '1') this.toggleAdvanced(true);
     } catch {
       // private mode: ignore
     }
@@ -2141,12 +2229,30 @@ const Controls = {
     }
   },
 
+  /// Show/hide the advanced source bar (persisted). `force` overrides.
+  toggleAdvanced(force) {
+    const bar = document.getElementById('advancedBar');
+    if (!bar) return;
+    const show = force === undefined ? bar.classList.contains('hidden') : force;
+    bar.classList.toggle('hidden', !show);
+    try {
+      localStorage.setItem(LS_ADVANCED, show ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  },
+
+  advancedVisible() {
+    return !document.getElementById('advancedBar')?.classList.contains('hidden');
+  },
+
   handleRefresh(reconnect) {
-    this.persist();
+    if (reconnect) this.persist();
     this.onRefresh?.({ reconnect });
   },
 
-  getSource() {
+  /// Advanced source override; empty string means "this page's own origin".
+  getBase() {
     return val('srcInput').trim();
   },
 
@@ -2184,6 +2290,17 @@ const Controls = {
   setSql(text) {
     const el = document.getElementById('sqlPreview');
     if (el) el.textContent = text;
+  },
+
+  /// Reflect the worker freeze state on the top toggle.
+  setFreeze(frozen) {
+    const btn = document.getElementById('freezeBtn');
+    const label = document.getElementById('freezeLabel');
+    if (btn) {
+      btn.dataset.state = frozen ? 'frozen' : 'running';
+      btn.title = frozen ? 'Unfreeze the worker' : 'Freeze the worker (stop all scraping)';
+    }
+    if (label) label.textContent = frozen ? 'Unfreeze' : 'Freeze';
   },
 };
 
@@ -2243,7 +2360,9 @@ async function refresh({ reconnect }) {
   refreshing = true;
   showError('');
   try {
-    const source = Controls.getSource();
+    // Frozen connection: default to this page's own collector (same origin);
+    // the Advanced source input overrides it for static/remote hosting.
+    const source = Controls.getBase() || window.location.origin;
     const range = Controls.getRange();
     if (reconnect || connectedUrl !== source) {
       setStatus('metadata-loading', `connecting to ${source}…`);
@@ -2274,7 +2393,7 @@ async function refresh({ reconnect }) {
   } catch (err) {
     const msg = err?.message ?? String(err);
     const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);
-    showError(`query failed: ${msg}${isHttp ? corsHint(Controls.getSource()) : ''}`);
+    showError(`query failed: ${msg}${isHttp ? corsHint(Controls.getBase() || window.location.origin) : ''}`);
     setStatus('error', msg);
   } finally {
     refreshing = false;
@@ -2304,17 +2423,27 @@ function setStatusCb({ phase, detail }) {
   setStatus(phase, detail);
 }
 
+/// Freeze/unfreeze the worker (halts all scraping) and refresh status.
+async function toggleFreeze() {
+  try {
+    if (TargetsClient.frozen) await TargetsClient.resumeWorker();
+    else await TargetsClient.freezeWorker();
+    await Promise.all([TargetsClient.refresh(), StatusClient.refreshNow()]);
+  } catch (err) {
+    showError(`freeze failed: ${err?.message ?? err}`);
+  }
+}
+
 function boot() {
   if (window.lucide?.createIcons) window.lucide.createIcons();
   Cards.reset();
   Charts.init();
   StatusClient.stop();
   TargetsClient.init();
-  Controls.init({ onRefresh: refresh, onCustom: runCustom });
+  Controls.init({ onRefresh: refresh, onCustom: runCustom, onFreeze: toggleFreeze });
   Controls.loadPersisted();
-  if (!Controls.getSource()) {
-    document.getElementById('srcInput').value = 'http://localhost:3000';
-  }
+  // Keep the top freeze toggle in sync with the worker's actual state.
+  StatusClient.onSnapshot = (snapshot) => Controls.setFreeze(snapshot.frozen);
   setStatus('idle', 'initializing…');
   // Engine warms up in the background; first refresh connects on demand.
   WorkerEngine.init(setStatusCb)

@@ -1,8 +1,14 @@
-//! Form controls: data-source input, range dropdown, custom visualizer.
-//! Persists source + range to localStorage.
+//! Form controls: range dropdown, worker freeze toggle, advanced data-source
+//! override, and the custom visualizer. Persists source/range/advanced to
+//! localStorage.
+//!
+//! The connection is frozen to this page's own collector by default; the
+//! source input lives behind the **Advanced** toggle for static hosting that
+//! points at a remote Parquet host.
 
 const LS_SOURCE = 'dm:baseUrl';
 const LS_RANGE = 'dm:range';
+const LS_ADVANCED = 'dm:advanced';
 
 function val(id) {
   return document.getElementById(id)?.value ?? '';
@@ -11,10 +17,12 @@ function val(id) {
 export const Controls = {
   onRefresh: null,
   onCustom: null,
+  onFreeze: null,
 
-  init({ onRefresh, onCustom }) {
+  init({ onRefresh, onCustom, onFreeze }) {
     this.onRefresh = onRefresh;
     this.onCustom = onCustom;
+    this.onFreeze = onFreeze;
 
     document.getElementById('srcGo')?.addEventListener('click', () => this.handleRefresh(true));
     document.getElementById('srcInput')?.addEventListener('keydown', (e) => {
@@ -23,6 +31,8 @@ export const Controls = {
     document.getElementById('rangeSelect')?.addEventListener('change', () => this.handleRefresh(false));
     document.getElementById('refreshBtn')?.addEventListener('click', () => this.handleRefresh(false));
     document.getElementById('customRun')?.addEventListener('click', () => onCustom?.());
+    document.getElementById('freezeBtn')?.addEventListener('click', () => onFreeze?.());
+    document.getElementById('advancedBtn')?.addEventListener('click', () => this.toggleAdvanced());
   },
 
   loadPersisted() {
@@ -33,6 +43,7 @@ export const Controls = {
       if (s && src) src.value = s;
       const r = localStorage.getItem(LS_RANGE);
       if (r && range && ['1h', '24h', 'all'].includes(r)) range.value = r;
+      if (localStorage.getItem(LS_ADVANCED) === '1') this.toggleAdvanced(true);
     } catch {
       // private mode: ignore
     }
@@ -47,12 +58,30 @@ export const Controls = {
     }
   },
 
+  /// Show/hide the advanced source bar (persisted). `force` overrides.
+  toggleAdvanced(force) {
+    const bar = document.getElementById('advancedBar');
+    if (!bar) return;
+    const show = force === undefined ? bar.classList.contains('hidden') : force;
+    bar.classList.toggle('hidden', !show);
+    try {
+      localStorage.setItem(LS_ADVANCED, show ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  },
+
+  advancedVisible() {
+    return !document.getElementById('advancedBar')?.classList.contains('hidden');
+  },
+
   handleRefresh(reconnect) {
-    this.persist();
+    if (reconnect) this.persist();
     this.onRefresh?.({ reconnect });
   },
 
-  getSource() {
+  /// Advanced source override; empty string means "this page's own origin".
+  getBase() {
     return val('srcInput').trim();
   },
 
@@ -90,5 +119,16 @@ export const Controls = {
   setSql(text) {
     const el = document.getElementById('sqlPreview');
     if (el) el.textContent = text;
+  },
+
+  /// Reflect the worker freeze state on the top toggle.
+  setFreeze(frozen) {
+    const btn = document.getElementById('freezeBtn');
+    const label = document.getElementById('freezeLabel');
+    if (btn) {
+      btn.dataset.state = frozen ? 'frozen' : 'running';
+      btn.title = frozen ? 'Unfreeze the worker' : 'Freeze the worker (stop all scraping)';
+    }
+    if (label) label.textContent = frozen ? 'Unfreeze' : 'Freeze';
   },
 };

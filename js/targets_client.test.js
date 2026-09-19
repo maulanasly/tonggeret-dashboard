@@ -21,17 +21,21 @@ test('parseAllow splits commas/whitespace', () => {
   assert.deepEqual(TargetsClient.parseAllow(''), []);
 });
 
-test('queueBadge reflects offline/paused/running/idle', () => {
+test('queueBadge reflects offline/frozen/paused/running/idle', () => {
   assert.deepEqual(TargetsClient.queueBadge(null), { text: 'offline', status: 'offline' });
-  assert.deepEqual(TargetsClient.queueBadge({ paused: true, depth: 2 }), {
+  assert.deepEqual(TargetsClient.queueBadge({ frozen: true, paused: false, depth: 3 }), {
+    text: 'frozen · 3 queued',
+    status: 'frozen',
+  });
+  assert.deepEqual(TargetsClient.queueBadge({ frozen: false, paused: true, depth: 2 }), {
     text: 'paused · 2 queued',
     status: 'degraded',
   });
-  assert.deepEqual(TargetsClient.queueBadge({ paused: false, depth: 1 }), {
+  assert.deepEqual(TargetsClient.queueBadge({ frozen: false, paused: false, depth: 1 }), {
     text: 'running · 1 queued',
     status: 'starting',
   });
-  assert.deepEqual(TargetsClient.queueBadge({ paused: false, depth: 0 }), {
+  assert.deepEqual(TargetsClient.queueBadge({ frozen: false, paused: false, depth: 0 }), {
     text: 'queue idle',
     status: 'ok',
   });
