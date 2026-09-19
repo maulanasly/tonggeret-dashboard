@@ -39,11 +39,16 @@ export const Controls = {
     const src = document.getElementById('srcInput');
     const range = document.getElementById('rangeSelect');
     try {
+      const advanced = localStorage.getItem(LS_ADVANCED) === '1';
+      // Migration: a source saved before the frozen-connection change (the
+      // old `http://localhost:3000` default) must not hijack the connection.
+      // Drop it unless the user is explicitly in Advanced mode.
+      if (!advanced) localStorage.removeItem(LS_SOURCE);
       const s = localStorage.getItem(LS_SOURCE);
       if (s && src) src.value = s;
       const r = localStorage.getItem(LS_RANGE);
       if (r && range && ['1h', '24h', 'all'].includes(r)) range.value = r;
-      if (localStorage.getItem(LS_ADVANCED) === '1') this.toggleAdvanced(true);
+      if (advanced) this.toggleAdvanced(true);
     } catch {
       // private mode: ignore
     }
@@ -80,8 +85,14 @@ export const Controls = {
     this.onRefresh?.({ reconnect });
   },
 
-  /// Advanced source override; empty string means "this page's own origin".
+  /// Advanced source override. Empty string means "this page's own origin".
+  ///
+  /// The override only applies while the Advanced bar is visible: a stale
+  /// `dm:baseUrl` from before the frozen-connection change (e.g. the old
+  /// `http://localhost:3000` default) must not silently redirect the
+  /// dashboard away from its own collector.
   getBase() {
+    if (!this.advancedVisible()) return '';
     return val('srcInput').trim();
   },
 

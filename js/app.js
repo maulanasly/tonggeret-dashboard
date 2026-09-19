@@ -7,7 +7,6 @@ import { HotClient } from './query_client.js';
 import { StatusClient } from './status_client.js';
 import { TargetsClient } from './targets_client.js';
 import { Queries } from './queries.js';
-import { WorkerEngine } from './duckdb_worker.js';
 import { Charts } from './charts.js';
 import { Cards } from './components/cards.js';
 import { Controls } from './components/controls.js';
@@ -145,14 +144,21 @@ function boot() {
   Controls.loadPersisted();
   // Keep the top freeze toggle in sync with the worker's actual state.
   StatusClient.onSnapshot = (snapshot) => Controls.setFreeze(snapshot.frozen);
-  setStatus('idle', 'initializing…');
-  // Engine warms up in the background; first refresh connects on demand.
-  WorkerEngine.init(setStatusCb)
-    .then(() => refresh({ reconnect: true }))
-    .catch((err) => {
-      showError(`wasm init failed: ${err?.message ?? err}`);
-      setStatus('error', 'wasm init failed');
-    });
+
+  // Status + targets are plain HTTP: start polling immediately so the
+  // connection chip reflects the collector without waiting for the WASM
+  // engine (which is only needed for the cold Parquet path).
+  const base = Controls.getBase() || window.location.origin;
+  StatusClient.watch(base);
+  TargetsClient.watch(base);
+
+  setStatus('idle', 'connecting…');
+  // Connect on demand: hot mode (query_range JSON) needs no WASM; cold mode
+  // initializes DuckDB-Wasm inside DataSource.connect.
+  refresh({ reconnect: true }).catch((err) => {
+    showError(`connect failed: ${err?.message ?? err}`);
+    setStatus('error', err?.message ?? 'connect failed');
+  });
 }
 
 if (document.readyState === 'loading') {
