@@ -43,7 +43,11 @@ pub fn router(static_dir: PathBuf, cold_dir: PathBuf, buffer: Arc<RecentBuffer>)
         )
         .route(
             "/api/v1/query_range",
-            axum::routing::get(query_range).with_state(buffer),
+            axum::routing::get(query_range).with_state(buffer.clone()),
+        )
+        .route(
+            "/api/v1/labels",
+            axum::routing::get(label_names).with_state(buffer),
         )
         .route(
             "/telemetry/cold/{file}",
@@ -78,6 +82,12 @@ async fn query_range(
         query::now_micros(),
     )?;
     Ok(Json(query::render_matrix(&buffer.query(&rq)?)))
+}
+
+/// Distinct buffered metric names: `GET /api/v1/labels` →
+/// `{"status":"success","data":[...]}`. Hot-mode metric picker source.
+async fn label_names(State(buffer): State<Arc<RecentBuffer>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "success", "data": buffer.names() }))
 }
 
 /// Serve one cold file by name (Range-capable). The filename is
@@ -226,5 +236,88 @@ mod tests {
         assert!(!dir.path().join("metrics_cold_old.parquet").exists());
         assert!(dir.path().join("metrics_cold_new.parquet").exists());
         assert!(dir.path().join("keep.txt").exists());
+    }
+
+    use crate::query::{BufferedSample, RecentBuffer};
+
+    fn seeded_buffer() -> Arc<RecentBuffer> {
+        let buffer = Arc::new(RecentBuffer::new(100));
+        buffer.push_batch(
+            "app",
+            &[BufferedSample {
+                ts_micros: 1_700_000_000_000_000,
+                name: "http_x".to_string(),
+                value: 2.0,
+                labels: vec![("scrape_target".to_string(), "app".to_string())],
+            }],
+        );
+        buffer
+    }
+
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn query_range_serves_buffered_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = super::router(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            seeded_buffer(),
+        );
+        let (status, body) = get(
+            app,
+            "/api/v1/query_range?query=http_x&start=1699999990&end=1700000010&step=60",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["resultType"], "matrix");
+        assert_eq!(body["data"]["result"][0]["metric"]["__name__"], "http_x");
+        assert_eq!(body["data"]["result"][0]["metric"]["scrape_target"], "app");
+        assert_eq!(body["data"]["result"][0]["values"][0][1], "2");
+    }
+
+    #[tokio::test]
+    async fn query_range_rejects_bad_params_as_prometheus_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = super::router(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            seeded_buffer(),
+        );
+        let (status, body) = get(
+            app,
+            "/api/v1/query_range?query=http_x&start=1&end=2&step=0s",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn labels_lists_buffered_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = super::router(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            seeded_buffer(),
+        );
+        let (status, body) = get(app, "/api/v1/labels").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "success", "data": ["http_x"]})
+        );
     }
 }
