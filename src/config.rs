@@ -18,8 +18,9 @@ pub struct TargetConfig {
     /// Full `/metrics` URL.
     pub url: String,
     /// Series-name prefixes accepted from this target (default covers
-    /// HTTP/business/collector series plus the optional visitor series —
-    /// see `default_allow`).
+    /// HTTP/business series plus the optional visitor series —
+    /// see `default_allow`). Never include `collector_`: the scrape
+    /// pipeline denies it before the allow check (`scrape::DENY_PREFIX`).
     #[serde(default = "default_allow")]
     pub allow: Vec<String>,
 }
@@ -114,22 +115,17 @@ impl Default for FjallSection {
     }
 }
 
-/// Default allowlist: HTTP/business/collector series plus the optional
+/// Default allowlist: HTTP/business series plus the optional
 /// visitor series (`visitors_total`, `unique_visitors_estimate`). An app
 /// without visitor instrumentation scrapes fine — it stores zero visitor
-/// rows instead of erroring.
+/// rows instead of erroring. `collector_*` is deliberately absent: scraped
+/// input with that prefix is denied before the allow check, so listing it
+/// here could never match.
 fn default_allow() -> Vec<String> {
-    [
-        "http_",
-        "beruang_",
-        "tonggeret_",
-        "collector_",
-        "visitors_",
-        "unique_",
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect()
+    ["http_", "beruang_", "tonggeret_", "visitors_", "unique_"]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 /// Config load/validation errors (fatal at startup: fail fast, like init).

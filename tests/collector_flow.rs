@@ -49,17 +49,10 @@ async fn scrape_flows_to_registry_and_cold_parquet() {
     let target = TargetConfig {
         name: "mock".to_string(),
         url: format!("http://{addr}/metrics"),
-        allow: [
-            "http_",
-            "visitors_",
-            "unique_",
-            "tonggeret_",
-            "collector_",
-            "beruang_",
-        ]
-        .iter()
-        .map(ToString::to_string)
-        .collect(),
+        allow: ["http_", "visitors_", "unique_", "tonggeret_", "beruang_"]
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     };
     let client = reqwest::Client::new();
     let status = tonggeret_dashboard::scrape::scrape_once(&client, &target, 5_000, 1_048_576).await;
