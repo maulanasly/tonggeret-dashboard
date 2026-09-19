@@ -58,7 +58,7 @@ scrape targets (/metrics) ──15s──▶ collector ──store──▶ Fjal
 
 | Method | Path | Source | Role |
 |---|---|---|---|
-| GET | `/` | prebuilt UI bundle (`dist/`) | serve |
+| GET | `/` | prebuilt UI bundle (`dist/`) | single-binary / serve |
 | GET | `/metrics` | live registry text (self + mirrored scraped series) | worker |
 | GET | `/healthz` | `{"status":"ok"}` liveness | both |
 | GET | `/telemetry/parquet` | newest cold export, Range-capable (404 until first compaction) | both |
@@ -196,8 +196,10 @@ One binary, two roles (`collector worker <config>` / `collector serve
 
 - **worker** — config → tonggeret/Fjall init → scrape loop → compaction/purge.
   Binds private/loopback. The only process that opens `data/fjall`. Serves
-  `/metrics`, the hot APIs, `/api/v1/status`, and `/healthz`. Does not serve
-  `dist/`.
+  `/metrics`, the hot APIs, `/api/v1/status`, `/healthz`, and the control
+  API. The explicit `worker` role does not serve `dist/`; the legacy
+  single-binary `collector <config>` runs the worker **and** serves the UI on
+  one port (pre-split behaviour).
 - **serve** — read-only. Serves `dist/` and the cold-file surface
   (`/api/files`, `/telemetry/parquet`, `/telemetry/cold/:file`) directly from
   the shared `data/cold`, and `/healthz`. Reverse-proxies

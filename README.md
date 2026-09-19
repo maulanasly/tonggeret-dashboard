@@ -27,11 +27,14 @@ cargo run -- collector.toml   # scrapes beruang :8000 → :8080
 # open http://localhost:8080/ — graphs read this collector's own history
 ```
 
-Two roles share the one binary (single-binary mode is the default):
+Two roles share the one binary: the legacy single-binary form (`cargo run
+-- collector.toml`) runs the worker **and** serves the dashboard on one
+port; the explicit split roles separate them.
 
 ```sh
-cargo run -- worker collector.toml   # scrape + store + hot API + status (loopback)
-cargo run -- serve  collector.toml   # read-only UI; proxies the worker, serves cold locally
+cargo run -- collector.toml          # single binary: scrape + store + UI + APIs (one port)
+cargo run -- worker collector.toml   # split worker (no UI, loopback)
+cargo run -- serve  collector.toml   # split dashboard; proxies the worker, serves cold locally
 ```
 
 `collector.toml`: targets (`name`/`url`/`allow` prefixes), `interval_secs`,
