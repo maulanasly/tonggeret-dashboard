@@ -1,29 +1,36 @@
-//! HTTP surface: prebuilt UI + self `/metrics` + cold Parquet + manifest.
+//! HTTP surface: prebuilt UI + self `/metrics` + cold Parquet + manifest +
+//! hot range queries.
 //!
 //! The UI bundle (`dist/`, served at `/`) is the same DuckDB-Wasm app the
 //! mock server hosts: it resolves `<base>/telemetry/parquet` (newest cold
 //! file, Range-capable via tonggeret) or the `/api/files` manifest below.
+//! `/api/v1/query_range` answers Prometheus-shaped JSON from the in-memory
+//! recent-samples buffer (process lifetime; cold Parquet stays the history
+//! of record).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::extract::{Path as UrlPath, Request, State};
+use axum::extract::{Path as UrlPath, Query as UrlQuery, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use tower::ServiceExt as _;
 
+use crate::query::{self, QueryError, RecentBuffer};
+
 /// Cold export filename shape (`tonggeret::storage` convention).
 const COLD_PREFIX: &str = "metrics_cold_";
 
-/// Build the full router: UI, scrape-compat endpoints, telemetry.
+/// Build the full router: UI, scrape-compat endpoints, telemetry, hot queries.
 ///
 /// NOTE: deliberately *no* `track` middleware here. The collector mirrors
 /// scraped samples into this same registry with an extra `scrape_target`
 /// label, so self `http_*` series (3 labels) would collide with scraped
 /// ones (4 labels) and panic the registry. Self-observability is the
 /// `collector_*` outcome series instead.
-pub fn router(static_dir: PathBuf, cold_dir: PathBuf) -> axum::Router {
+pub fn router(static_dir: PathBuf, cold_dir: PathBuf, buffer: Arc<RecentBuffer>) -> axum::Router {
     let files_dir = Arc::new(cold_dir.clone());
     let serve_dir = files_dir.clone();
     axum::Router::new()
@@ -35,6 +42,10 @@ pub fn router(static_dir: PathBuf, cold_dir: PathBuf) -> axum::Router {
             }),
         )
         .route(
+            "/api/v1/query_range",
+            axum::routing::get(query_range).with_state(buffer),
+        )
+        .route(
             "/telemetry/cold/{file}",
             axum::routing::get(serve_cold_file).with_state(serve_dir),
         )
@@ -44,6 +55,29 @@ pub fn router(static_dir: PathBuf, cold_dir: PathBuf) -> axum::Router {
         )
         .merge(tonggeret::middleware::axum::parquet_route(cold_dir))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
+}
+
+/// Prometheus-shaped range query over recent samples:
+/// `GET /api/v1/query_range?query=<name|{...}>&start=<unix>&end=<unix>&step=<dur>`.
+/// Subset contract lives on [`crate::query`]; violations are 400, never truncation.
+async fn query_range(
+    State(buffer): State<Arc<RecentBuffer>>,
+    UrlQuery(params): UrlQuery<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, QueryError> {
+    if params.contains_key("match[]") {
+        return Err(QueryError::bad_data(
+            "match[] is not supported; put exact matchers in query={...}",
+        ));
+    }
+    let get = |k: &str| params.get(k).map_or("", String::as_str);
+    let rq = query::parse_range_query(
+        get("query"),
+        get("start"),
+        get("end"),
+        get("step"),
+        query::now_micros(),
+    )?;
+    Ok(Json(query::render_matrix(&buffer.query(&rq)?)))
 }
 
 /// Serve one cold file by name (Range-capable). The filename is

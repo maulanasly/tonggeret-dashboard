@@ -4,5 +4,6 @@
 //! interval, store through the tonggeret engine, serve the UI + history.
 
 pub mod config;
+pub mod query;
 pub mod scrape;
 pub mod serve;

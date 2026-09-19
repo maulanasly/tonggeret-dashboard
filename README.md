@@ -27,6 +27,18 @@ cargo run -- collector.toml   # scrapes beruang :8000 → :8080
 | GET | `/telemetry/parquet` | newest cold export (Range-capable) |
 | GET | `/telemetry/cold/:file` | named cold export, allowlisted to `metrics_cold_*.parquet` |
 | GET | `/api/files` | JSON manifest of cold files (auto-used by the UI) |
+| GET | `/api/v1/query_range` | Prometheus-shaped matrix JSON over recent samples (process lifetime) |
+
+`query_range` params: `query` (exact name or `{__name__="x",k="v"}` with
+`=` matchers only), `start`/`end` (unix seconds), `step` (seconds or
+`<n>s|m|h|d|w`, min 1s). Caps: 7-day range, 10k points — over-limit is a
+400, never silent truncation. Per `(series, step-bucket)` the latest sample
+wins; a `start` older than the buffer succeeds with a `warnings` entry.
+Example:
+
+```sh
+curl -s 'http://localhost:8080/api/v1/query_range?query=http_requests_total&start=1700000000&end=1700003600&step=60' | head -c 400
+```
 
 ## Series catalog
 
