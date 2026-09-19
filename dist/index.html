@@ -343,6 +343,12 @@ input:focus-visible, select:focus-visible, button:focus-visible {
         <i data-lucide="snowflake"></i>
         <span id="freezeLabel">Freeze</span>
       </button>
+      <label class="range-label" for="targetFilter">
+        <i data-lucide="crosshair"></i>
+        <select id="targetFilter" title="Filter all charts + summary by target">
+          <option value="all" selected>All targets</option>
+        </select>
+      </label>
       <label class="range-label" for="rangeSelect">
         <i data-lucide="calendar-range"></i>
         <select id="rangeSelect">
@@ -582,14 +588,29 @@ function bucketExpr(range) {
   return `date_trunc('${part}', ts)`;
 }
 
+/// `AND`-fragment restricting rows to one `scrape_target` (`''`/`all` = no
+/// filter). Returns `''` when unfiltered so callers can append it directly.
+function targetFilter(target) {
+  const t = String(target ?? '').trim();
+  if (t === '' || t === 'all') return '';
+  return ` AND json_extract_string(labels, '$.scrape_target') = '${lit(t)}'`;
+}
+
+/// WHERE clause combining the time range and an optional target filter.
+function whereClause(range, target) {
+  return `${timeFilter(range)}${targetFilter(target)}`;
+}
+
 const Queries = {
   Ranges,
   timeFilter,
   bucketExpr,
+  targetFilter,
+  whereClause,
 
   /// Request throughput + latency breakdown in a single round-trip.
-  throughputLatency(range) {
-    const filter = timeFilter(range);
+  throughputLatency(range, target = '') {
+    const filter = whereClause(range, target);
     const bucket = bucketExpr(range);
     return (
       `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
@@ -604,8 +625,8 @@ const Queries = {
   },
 
   /// HTTP 4xx/5xx breakdown grouped by endpoint path.
-  errorDistribution(range) {
-    const filter = timeFilter(range);
+  errorDistribution(range, target = '') {
+    const filter = whereClause(range, target);
     return (
       `SELECT COALESCE(NULLIF(json_extract_string(labels, '$.path'), ''), '(unknown)') AS path,\n` +
       `  count(*) FILTER (WHERE json_extract_string(labels, '$.status') LIKE '4%') AS c4xx,\n` +
@@ -625,12 +646,23 @@ const Queries = {
     return 'SELECT DISTINCT name FROM metrics_all ORDER BY 1 LIMIT 200';
   },
 
+  /// Distinct `scrape_target` values (target-filter options when the
+  /// collector's registry is unavailable, e.g. static Parquet hosting).
+  listTargets() {
+    return (
+      `SELECT DISTINCT COALESCE(NULLIF(json_extract_string(labels, '$.scrape_target'), ''), '(unknown)') AS target\n` +
+      `FROM metrics_all\n` +
+      `WHERE name = 'http_requests_total'\n` +
+      `ORDER BY 1`
+    );
+  },
+
   /// Visitor preset: latest `visitors_total` and `unique_visitors_estimate`
   /// per bucket, grouped by target + region. Both are read as latest
   /// (`arg_max(value, ts)`): the uniques estimate is a gauge and must
   /// never be summed — take latest per `(target, region)`.
-  visitorsByRegion(range) {
-    const filter = timeFilter(range);
+  visitorsByRegion(range, target = '') {
+    const filter = whereClause(range, target);
     const bucket = bucketExpr(range);
     return (
       `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
@@ -647,11 +679,18 @@ const Queries = {
 
   /// General-purpose counter/gauge series builder.
   ///
-  /// `opts`: `{ metric, agg, labelKey, labelValue, range }`.
+  /// `opts`: `{ metric, agg, labelKey, labelValue, range, target }`.
   /// `agg` ∈ `count|sum|avg|min|max|p50|p99`.
   customSeries(opts) {
-    const { metric, agg = 'avg', labelKey = '', labelValue = '', range = '24h' } = opts;
-    const filter = timeFilter(range);
+    const {
+      metric,
+      agg = 'avg',
+      labelKey = '',
+      labelValue = '',
+      range = '24h',
+      target = '',
+    } = opts;
+    const filter = whereClause(range, target);
     const bucket = bucketExpr(range);
     const aggSql = (() => {
       switch (agg) {
@@ -949,11 +988,11 @@ const DataSource = {
     return { urls, mode: this.mode };
   },
 
-  async refreshAll(range, onStatus) {
-    const throughputSql = Queries.throughputLatency(range);
-    const errorsSql = Queries.errorDistribution(range);
+  async refreshAll(range, target, onStatus) {
+    const throughputSql = Queries.throughputLatency(range, target);
+    const errorsSql = Queries.errorDistribution(range, target);
     const namesSql = Queries.listMetricNames();
-    const visitorsSql = Queries.visitorsByRegion(range);
+    const visitorsSql = Queries.visitorsByRegion(range, target);
     const [tRows, eRows, nRows, vRows] = await Promise.all([
       WorkerEngine.query(throughputSql, onStatus, 'aggregating throughput + latency…'),
       WorkerEngine.query(errorsSql, onStatus, 'aggregating error distribution…'),
@@ -966,6 +1005,16 @@ const DataSource = {
     const visitors = vRows.map(normVisitorRow);
     const bucketSecs = Queries.Ranges[range]?.bucketSecs ?? 3600;
     return { throughput, errors, names, visitors, summary: this.summarize(throughput, errors, bucketSecs) };
+  },
+
+  /// Distinct `scrape_target` values for the target filter (cold path).
+  async listTargets(onStatus) {
+    try {
+      const rows = await WorkerEngine.query(Queries.listTargets(), onStatus, 'listing targets…');
+      return rows.map((r) => String(r.target)).filter(Boolean).sort();
+    } catch {
+      return [];
+    }
   },
 
   async runCustom(opts, onStatus) {
@@ -1270,28 +1319,76 @@ const HotClient = {
     return { url, result: body?.data?.result ?? [] };
   },
 
-  selector(metric, labelKey, labelValue) {
-    if (labelKey.trim() === '') return metric;
-    if (labelValue.trim() === '') return metric;
+  selector(metric, labelKey, labelValue, target = '') {
     const q = (v) => `"${String(v).replaceAll('"', '')}"`;
-    return `{__name__=${q(metric)},${labelKey.trim()}=${q(labelValue.trim())}}`;
+    const matchers = [];
+    if (labelKey.trim() !== '' && labelValue.trim() !== '') {
+      matchers.push(`${labelKey.trim()}=${q(labelValue)}`);
+    }
+    const t = String(target ?? '').trim();
+    if (t !== '' && t !== 'all') matchers.push(`scrape_target=${q(t)}`);
+    if (matchers.length === 0) return metric;
+    return `{__name__=${q(metric)},${matchers.join(',')}}`;
   },
 
-  async refreshAll(range, onStatus) {
+  /// Selector for a metric optionally narrowed to one `scrape_target`.
+  targetSelector(metric, target) {
+    return this.selector(metric, '', '', target);
+  },
+
+  /// Distinct targets present in the collector's runtime registry. Used to
+  /// populate the target filter; empty when unavailable.
+  async listTargets() {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/v1/targets`);
+      if (!res.ok) return [];
+      const body = await res.json();
+      const targets = Array.isArray(body?.targets) ? body.targets : [];
+      return [...new Set(targets.map((t) => String(t?.name ?? '')).filter(Boolean))].sort();
+    } catch {
+      return [];
+    }
+  },
+
+  async refreshAll(range, target, onStatus) {
+    const target0 = String(target ?? '').trim();
     const [total, sum, count, names, visTotal, visUniques] = await Promise.all([
-      this.rangeQuery('http_requests_total', range, onStatus, 'aggregating throughput…'),
-      this.rangeQuery('http_request_duration_ms_sum', range, onStatus, 'aggregating latency…'),
-      this.rangeQuery('http_request_duration_ms_count', range, onStatus, 'aggregating latency…'),
+      this.rangeQuery(
+        this.targetSelector('http_requests_total', target0),
+        range,
+        onStatus,
+        'aggregating throughput…',
+      ),
+      this.rangeQuery(
+        this.targetSelector('http_request_duration_ms_sum', target0),
+        range,
+        onStatus,
+        'aggregating latency…',
+      ),
+      this.rangeQuery(
+        this.targetSelector('http_request_duration_ms_count', target0),
+        range,
+        onStatus,
+        'aggregating latency…',
+      ),
       (async () => {
         const res = await fetch(`${this.baseUrl}/api/v1/labels`);
         if (!res.ok) return [];
         const body = await res.json();
         return HotReshape.namesFromLabels(body?.data);
       })().catch(() => []),
-      this.rangeQuery('visitors_total', range, onStatus, 'aggregating visitors…').catch(() => ({ result: [] })),
-      this.rangeQuery('unique_visitors_estimate', range, onStatus, 'aggregating visitors…').catch(
-        () => ({ result: [] }),
-      ),
+      this.rangeQuery(
+        this.targetSelector('visitors_total', target0),
+        range,
+        onStatus,
+        'aggregating visitors…',
+      ).catch(() => ({ result: [] })),
+      this.rangeQuery(
+        this.targetSelector('unique_visitors_estimate', target0),
+        range,
+        onStatus,
+        'aggregating visitors…',
+      ).catch(() => ({ result: [] })),
     ]);
     const totalGroups = HotReshape.groupBySeries(total.result);
     const throughput = HotReshape.throughputFromGroups(
@@ -1317,7 +1414,7 @@ const HotClient = {
 
   async runCustom(opts, onStatus) {
     const { url, result } = await this.rangeQuery(
-      this.selector(opts.metric, opts.labelKey ?? '', opts.labelValue ?? ''),
+      this.selector(opts.metric, opts.labelKey ?? '', opts.labelValue ?? '', opts.target ?? ''),
       opts.range,
       onStatus,
       `plotting ${opts.metric}…`,
@@ -1557,6 +1654,13 @@ const TargetsClient = {
     return { text: 'queue idle', status: 'ok' };
   },
 
+  /// Newest `limit` finished jobs for display (backend keeps a longer
+  /// history; the panel shows only the most recent few).
+  recentRuns(queue, limit = 5) {
+    const recent = Array.isArray(queue?.recent) ? queue.recent : [];
+    return recent.slice(0, limit);
+  },
+
   loadToken() {
     try {
       return localStorage.getItem(TOKEN_KEY) ?? '';
@@ -1578,15 +1682,21 @@ const TargetsClient = {
     document.getElementById(id)?.addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-action]');
       if (!btn) return;
-      const { action, id: rowId, url } = btn.dataset;
-      this.act(() => this.dispatch(action, rowId, url));
+      const { action, id: rowId, url, name } = btn.dataset;
+      this.act(() => this.dispatch(action, rowId, url, name));
     });
   },
 
-  async dispatch(action, id, url) {
+  async dispatch(action, id, url, name) {
     if (action === 'enable') return this.setEnabled(id, true);
     if (action === 'disable') return this.setEnabled(id, false);
-    if (action === 'remove') return this.remove(id);
+    if (action === 'remove') {
+      // Config targets are tombstoned (persisted); confirm to avoid accidents.
+      if (typeof window.confirm === 'function' && !window.confirm(`Remove target ${name || id}?`)) {
+        return;
+      }
+      return this.remove(id);
+    }
     if (action === 'enqueue') return this.enqueue([url]);
     if (action === 'cancel') return this.cancel(id);
     throw new Error(`unknown action ${action}`);
@@ -1751,13 +1861,10 @@ const TargetsClient = {
     const esc = (s) => this.esc(s);
     el.innerHTML = list
       .map((t) => {
-        const dynamic = t.origin === 'dynamic';
         const buttons =
-          `<button class="btn tiny" data-action="enqueue" data-url="${esc(t.url)}" title="Run now">run</button>` +
-          (dynamic
-            ? `<button class="btn tiny" data-action="${t.enabled ? 'disable' : 'enable'}" data-id="${esc(t.id)}">${t.enabled ? 'disable' : 'enable'}</button>` +
-              `<button class="btn tiny danger" data-action="remove" data-id="${esc(t.id)}">remove</button>`
-            : '');
+          `<button class="btn tiny" data-action="enqueue" data-url="${esc(t.url)}" data-name="${esc(t.name)}" title="Run now">run</button>` +
+          `<button class="btn tiny" data-action="${t.enabled ? 'disable' : 'enable'}" data-id="${esc(t.id)}" data-name="${esc(t.name)}">${t.enabled ? 'disable' : 'enable'}</button>` +
+          `<button class="btn tiny danger" data-action="remove" data-id="${esc(t.id)}" data-name="${esc(t.name)}">remove</button>`;
         return (
           `<div class="target-row">` +
           `<span class="target-name">${esc(t.name)}</span>` +
@@ -1796,8 +1903,7 @@ const TargetsClient = {
           `<button class="btn tiny danger" data-action="cancel" data-id="${esc(j.id)}">cancel</button></div>`,
       )
       .join('');
-    const recent = (queue.recent ?? [])
-      .slice(0, 10)
+    const recent = this.recentRuns(queue)
       .map(
         (j) =>
           `<div class="queue-row done"><span class="queue-state" data-state="${esc(j.state)}">${esc(j.state)}</span>` +
@@ -2200,6 +2306,7 @@ const Controls = {
       if (e.key === 'Enter') this.handleRefresh(true);
     });
     document.getElementById('rangeSelect')?.addEventListener('change', () => this.handleRefresh(false));
+    document.getElementById('targetFilter')?.addEventListener('change', () => this.handleRefresh(false));
     document.getElementById('refreshBtn')?.addEventListener('click', () => this.handleRefresh(false));
     document.getElementById('customRun')?.addEventListener('click', () => onCustom?.());
     document.getElementById('freezeBtn')?.addEventListener('click', () => onFreeze?.());
@@ -2272,6 +2379,32 @@ const Controls = {
     return ['1h', '24h', 'all'].includes(r) ? r : '24h';
   },
 
+  /// Selected target filter (`'all'` = no filter).
+  getTarget() {
+    return val('targetFilter').trim() || 'all';
+  },
+
+  /// Repopulate the target filter, preserving the current selection when it
+  /// still exists (otherwise reset to "All targets").
+  setTargets(names) {
+    const sel = document.getElementById('targetFilter');
+    if (!sel) return;
+    const list = Array.isArray(names) ? [...new Set(names.filter(Boolean))].sort() : [];
+    const prev = sel.value || 'all';
+    sel.innerHTML = '';
+    const all = document.createElement('option');
+    all.value = 'all';
+    all.textContent = 'All targets';
+    sel.appendChild(all);
+    for (const n of list) {
+      const opt = document.createElement('option');
+      opt.value = n;
+      opt.textContent = n;
+      sel.appendChild(opt);
+    }
+    sel.value = list.includes(prev) || prev === 'all' ? prev : 'all';
+  },
+
   getCustom() {
     return {
       metric: val('metricSelect').trim() || 'http_request_duration_ms',
@@ -2279,6 +2412,7 @@ const Controls = {
       labelKey: val('labelKey').trim(),
       labelValue: val('labelValue').trim(),
       range: this.getRange(),
+      target: this.getTarget(),
     };
   },
 
@@ -2375,6 +2509,7 @@ async function refresh({ reconnect }) {
     // the Advanced source input overrides it for static/remote hosting.
     const source = Controls.getBase() || window.location.origin;
     const range = Controls.getRange();
+    const target = Controls.getTarget();
     if (reconnect || connectedUrl !== source) {
       setStatus('metadata-loading', `connecting to ${source}…`);
       useHot = await HotClient.probe(source).catch(() => false);
@@ -2390,17 +2525,22 @@ async function refresh({ reconnect }) {
       // single-binary too).
       StatusClient.watch(connectedUrl);
       TargetsClient.watch(connectedUrl);
+      // Populate the target filter from the live data source.
+      const targetNames = useHot
+        ? await HotClient.listTargets().catch(() => [])
+        : await DataSource.listTargets(setStatusCb).catch(() => []);
+      Controls.setTargets(targetNames);
     }
     const data = useHot
-      ? await HotClient.refreshAll(range, setStatusCb)
-      : await DataSource.refreshAll(range, setStatusCb);
+      ? await HotClient.refreshAll(range, target, setStatusCb)
+      : await DataSource.refreshAll(range, target, setStatusCb);
     Cards.render(data.summary, useHot ? HotClient.mode : DataSource.mode);
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);
     Charts.renderVisitors(data.visitors ?? []);
     Controls.setNames(data.names);
-    Controls.setSql(useHot ? `hot: ${HotClient.baseUrl} (query_range)` : Queries.throughputLatency(range));
+    Controls.setSql(useHot ? `hot: ${HotClient.baseUrl} (query_range)` : Queries.throughputLatency(range, target));
   } catch (err) {
     const msg = err?.message ?? String(err);
     const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);

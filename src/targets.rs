@@ -1,8 +1,10 @@
 //! Runtime target registry: config targets plus dynamically added ones.
 //!
-//! `collector.toml` targets are immutable (`origin = config`). Targets added
-//! through the control API are `origin = dynamic`, persisted to
-//! `state.targets_file` (atomic temp+rename) and reloaded at worker start.
+//! `collector.toml` targets are declared with `origin = config` but can be
+//! disabled or removed at runtime; those changes are persisted as overrides
+//! in `state.targets_file` (atomic temp+rename) so they survive restarts.
+//! Targets added through the control API are `origin = dynamic` and stored
+//! in the same file.
 //!
 //! Two modes:
 //! * `recurring` — swept by the periodic executor on every `interval_secs`.
@@ -11,6 +13,7 @@
 //! Target names are the `scrape_target` label and must stay unique. URLs are
 //! deduplicated (exact, trimmed) against both config and dynamic targets.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -28,7 +31,7 @@ pub const DEFAULT_ALLOW_PREFIXES: &[&str] =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
-    /// Declared in `collector.toml`; not removable.
+    /// Declared in `collector.toml`; overridable via `TargetOverride`.
     Config,
     /// Added through the control API; persisted.
     Dynamic,
@@ -96,17 +99,50 @@ pub enum TargetError {
     Persist(String),
 }
 
-/// Config + dynamic targets, with persistence for the dynamic set.
+/// Runtime override for a config target, persisted across restarts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetOverride {
+    /// Explicit enable/disable (`None` = leave as config declares).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Tombstone: the config target is removed at runtime.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+}
+
+/// On-disk shape of `state.targets_file`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedState {
+    /// Dynamically added targets.
+    #[serde(default)]
+    targets: Vec<Target>,
+    /// Config-target overrides, keyed by target id (`cfg:<name>`).
+    #[serde(default)]
+    overrides: BTreeMap<String, TargetOverride>,
+}
+
+/// Config + dynamic targets, with persistence for the dynamic set and
+/// config overrides.
 #[derive(Debug)]
 pub struct TargetRegistry {
     path: PathBuf,
     max_dynamic: usize,
-    inner: RwLock<Vec<Target>>,
+    inner: RwLock<RegistryInner>,
+}
+
+#[derive(Debug)]
+struct RegistryInner {
+    targets: Vec<Target>,
+    overrides: BTreeMap<String, TargetOverride>,
 }
 
 impl TargetRegistry {
-    /// Build from config targets + the persisted dynamic file. A corrupt or
-    /// unreadable dynamic file is an error (fail fast, like storage init).
+    /// Build from config targets + the persisted state file. A corrupt or
+    /// unreadable state file is an error (fail fast, like storage init).
+    ///
+    /// Backward compatible: an older file holding a bare `[Target, …]` array
+    /// (dynamic targets only) is still accepted; the next persist rewrites
+    /// it in the object shape.
     pub fn load(
         config_targets: &[TargetConfig],
         path: &Path,
@@ -126,23 +162,41 @@ impl TargetRegistry {
             })
             .collect();
 
+        let mut state = PersistedState::default();
         if path.exists() {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("read {}: {e}", path.display()))?;
-            let stored: Vec<Target> = serde_json::from_str(&text)
-                .map_err(|e| format!("parse {}: {e}", path.display()))?;
-            for mut t in stored {
-                // Stored files only ever hold dynamic targets; enforce it so a
-                // hand-edited file cannot masquerade as config.
-                t.origin = Origin::Dynamic;
-                if all.iter().any(|x| x.url == t.url || x.name == t.name) {
-                    return Err(format!(
-                        "dynamic target {} conflicts with a config target",
-                        t.name
-                    ));
+            state = match serde_json::from_str::<PersistedState>(&text) {
+                Ok(s) => s,
+                // Legacy shape: a bare array of dynamic targets.
+                Err(_) => PersistedState {
+                    targets: serde_json::from_str::<Vec<Target>>(&text)
+                        .map_err(|e| format!("parse {}: {e}", path.display()))?,
+                    overrides: BTreeMap::new(),
+                },
+            };
+        }
+
+        // Apply config overrides (disable / tombstone) before dynamic targets.
+        for target in &mut all {
+            if let Some(ov) = state.overrides.get(&target.id) {
+                if let Some(enabled) = ov.enabled {
+                    target.enabled = enabled;
                 }
-                all.push(t);
             }
+        }
+
+        for mut t in state.targets {
+            // Stored files only ever hold dynamic targets; enforce it so a
+            // hand-edited file cannot masquerade as config.
+            t.origin = Origin::Dynamic;
+            if all.iter().any(|x| x.url == t.url || x.name == t.name) {
+                return Err(format!(
+                    "dynamic target {} conflicts with a config target",
+                    t.name
+                ));
+            }
+            all.push(t);
         }
 
         let dynamic_count = all.iter().filter(|t| t.origin == Origin::Dynamic).count();
@@ -155,14 +209,27 @@ impl TargetRegistry {
         Ok(Self {
             path: path.to_path_buf(),
             max_dynamic,
-            inner: RwLock::new(all),
+            inner: RwLock::new(RegistryInner {
+                targets: all,
+                overrides: state.overrides,
+            }),
         })
     }
 
-    /// All targets (config first, then dynamic), in insertion order.
+    /// All visible targets (config first, then dynamic), in insertion order.
+    /// Tombstoned config targets are filtered out.
     #[must_use]
     pub fn list(&self) -> Vec<Target> {
-        self.inner.read().map(|t| t.clone()).unwrap_or_default()
+        self.inner
+            .read()
+            .map(|i| {
+                i.targets
+                    .iter()
+                    .filter(|t| !i.overrides.get(&t.id).is_some_and(|ov| ov.removed))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Recurring + enabled targets, for the periodic sweep.
@@ -189,12 +256,16 @@ impl TargetRegistry {
             .write()
             .map_err(|_| TargetError::Persist("registry lock poisoned".to_string()))?;
 
-        if guard.iter().any(|t| t.url == url) {
+        if guard.targets.iter().any(|t| t.url == url) {
             return Err(TargetError::Invalid(format!(
                 "url already configured: {url}"
             )));
         }
-        let dynamic = guard.iter().filter(|t| t.origin == Origin::Dynamic).count();
+        let dynamic = guard
+            .targets
+            .iter()
+            .filter(|t| t.origin == Origin::Dynamic)
+            .count();
         if dynamic >= self.max_dynamic {
             return Err(TargetError::Limit(format!(
                 "dynamic target limit reached ({})",
@@ -204,12 +275,12 @@ impl TargetRegistry {
 
         let name = match name.map(str::trim).filter(|s| !s.is_empty()) {
             Some(n) => {
-                if guard.iter().any(|t| t.name == n) {
+                if guard.targets.iter().any(|t| t.name == n) {
                     return Err(TargetError::Invalid(format!("name already used: {n}")));
                 }
                 n.to_string()
             }
-            None => unique_slug(&guard, &slug_from_url(&url)),
+            None => unique_slug(&guard.targets, &slug_from_url(&url)),
         };
         let allow = match allow.filter(|a| !a.is_empty()) {
             Some(a) => a.to_vec(),
@@ -228,48 +299,54 @@ impl TargetRegistry {
             mode,
             created_at: now_unix(),
         };
-        guard.push(target.clone());
+        guard.targets.push(target.clone());
         self.persist_locked(&guard)?;
         Ok(target)
     }
 
-    /// Enable/disable a target (config targets are immutable).
+    /// Enable/disable any target. Config-target changes are persisted as an
+    /// override; enabling/disabling also clears a removal tombstone (the
+    /// config target reappears).
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Target, TargetError> {
         let mut guard = self
             .inner
             .write()
             .map_err(|_| TargetError::Persist("registry lock poisoned".to_string()))?;
-        let entry = guard
-            .iter_mut()
-            .find(|t| t.id == id)
+        let idx = guard
+            .targets
+            .iter()
+            .position(|t| t.id == id)
             .ok_or_else(|| TargetError::NotFound(id.to_string()))?;
-        if entry.origin == Origin::Config {
-            return Err(TargetError::Invalid(
-                "config targets cannot be changed".to_string(),
-            ));
+        guard.targets[idx].enabled = enabled;
+        if guard.targets[idx].origin == Origin::Config {
+            let ov = guard.overrides.entry(id.to_string()).or_default();
+            ov.enabled = Some(enabled);
+            ov.removed = false;
         }
-        entry.enabled = enabled;
-        let updated = entry.clone();
+        let updated = guard.targets[idx].clone();
         self.persist_locked(&guard)?;
         Ok(updated)
     }
 
-    /// Remove a dynamic target.
+    /// Remove any target. Dynamic targets are dropped; config targets are
+    /// tombstoned (hidden until re-enabled or the override is cleared).
     pub fn remove(&self, id: &str) -> Result<Target, TargetError> {
         let mut guard = self
             .inner
             .write()
             .map_err(|_| TargetError::Persist("registry lock poisoned".to_string()))?;
         let idx = guard
+            .targets
             .iter()
             .position(|t| t.id == id)
             .ok_or_else(|| TargetError::NotFound(id.to_string()))?;
-        if guard[idx].origin == Origin::Config {
-            return Err(TargetError::Invalid(
-                "config targets cannot be removed".to_string(),
-            ));
+        if guard.targets[idx].origin == Origin::Config {
+            guard.overrides.entry(id.to_string()).or_default().removed = true;
+            let hidden = guard.targets[idx].clone();
+            self.persist_locked(&guard)?;
+            return Ok(hidden);
         }
-        let removed = guard.remove(idx);
+        let removed = guard.targets.remove(idx);
         self.persist_locked(&guard)?;
         Ok(removed)
     }
@@ -281,13 +358,18 @@ impl TargetRegistry {
         self.list().into_iter().find(|t| t.url == url)
     }
 
-    /// Write only the dynamic targets, atomically (temp + rename).
-    fn persist_locked(&self, targets: &[Target]) -> Result<(), TargetError> {
-        let dynamic: Vec<&Target> = targets
-            .iter()
-            .filter(|t| t.origin == Origin::Dynamic)
-            .collect();
-        let json = serde_json::to_string_pretty(&dynamic)
+    /// Write dynamic targets + config overrides, atomically (temp + rename).
+    fn persist_locked(&self, inner: &RegistryInner) -> Result<(), TargetError> {
+        let state = PersistedState {
+            targets: inner
+                .targets
+                .iter()
+                .filter(|t| t.origin == Origin::Dynamic)
+                .cloned()
+                .collect(),
+            overrides: inner.overrides.clone(),
+        };
+        let json = serde_json::to_string_pretty(&state)
             .map_err(|e| TargetError::Persist(e.to_string()))?;
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -461,12 +543,56 @@ mod tests {
     }
 
     #[test]
-    fn config_targets_are_immutable_and_cap_applies() {
+    fn config_targets_can_be_disabled_and_removed_persistently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        let registry = TargetRegistry::load(&config_targets(), &path, 1).unwrap();
+        let disabled = registry.set_enabled("cfg:beruang", false).unwrap();
+        assert!(!disabled.enabled);
+        assert!(registry.enabled_recurring().is_empty());
+
+        // Reload: the disable override sticks.
+        let reloaded = TargetRegistry::load(&config_targets(), &path, 1).unwrap();
+        assert!(!reloaded.list()[0].enabled);
+        assert!(reloaded.enabled_recurring().is_empty());
+
+        // Re-enabling clears it.
+        reloaded.set_enabled("cfg:beruang", true).unwrap();
+        let reloaded = TargetRegistry::load(&config_targets(), &path, 1).unwrap();
+        assert!(reloaded.list()[0].enabled);
+
+        // Remove tombstones it across reloads.
+        reloaded.remove("cfg:beruang").unwrap();
+        assert!(reloaded.list().is_empty());
+        let reloaded = TargetRegistry::load(&config_targets(), &path, 1).unwrap();
+        assert!(reloaded.list().is_empty());
+        assert!(reloaded.enabled_recurring().is_empty());
+
+        // Enabling a tombstoned config target revives it.
+        reloaded.set_enabled("cfg:beruang", true).unwrap();
+        assert_eq!(reloaded.list().len(), 1);
+    }
+
+    #[test]
+    fn legacy_array_state_file_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("targets.json");
+        std::fs::write(
+            &path,
+            r#"[{"id":"t1:0","name":"legacy","url":"https://legacy.example/metrics",
+                "allow":["http_"],"enabled":true,"origin":"dynamic","mode":"recurring","created_at":0}]"#,
+        )
+        .unwrap();
+        let registry = TargetRegistry::load(&config_targets(), &path, 8).unwrap();
+        let names: Vec<String> = registry.list().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["beruang".to_string(), "legacy".to_string()]);
+    }
+
+    #[test]
+    fn dynamic_cap_applies() {
         let dir = tempfile::tempdir().unwrap();
         let registry =
             TargetRegistry::load(&config_targets(), &dir.path().join("t.json"), 1).unwrap();
-        assert!(registry.set_enabled("cfg:beruang", false).is_err());
-        assert!(registry.remove("cfg:beruang").is_err());
         registry
             .add_dynamic(None, "https://a.example", None, Mode::Once)
             .unwrap();

@@ -51,28 +51,76 @@ export const HotClient = {
     return { url, result: body?.data?.result ?? [] };
   },
 
-  selector(metric, labelKey, labelValue) {
-    if (labelKey.trim() === '') return metric;
-    if (labelValue.trim() === '') return metric;
+  selector(metric, labelKey, labelValue, target = '') {
     const q = (v) => `"${String(v).replaceAll('"', '')}"`;
-    return `{__name__=${q(metric)},${labelKey.trim()}=${q(labelValue.trim())}}`;
+    const matchers = [];
+    if (labelKey.trim() !== '' && labelValue.trim() !== '') {
+      matchers.push(`${labelKey.trim()}=${q(labelValue)}`);
+    }
+    const t = String(target ?? '').trim();
+    if (t !== '' && t !== 'all') matchers.push(`scrape_target=${q(t)}`);
+    if (matchers.length === 0) return metric;
+    return `{__name__=${q(metric)},${matchers.join(',')}}`;
   },
 
-  async refreshAll(range, onStatus) {
+  /// Selector for a metric optionally narrowed to one `scrape_target`.
+  targetSelector(metric, target) {
+    return this.selector(metric, '', '', target);
+  },
+
+  /// Distinct targets present in the collector's runtime registry. Used to
+  /// populate the target filter; empty when unavailable.
+  async listTargets() {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/v1/targets`);
+      if (!res.ok) return [];
+      const body = await res.json();
+      const targets = Array.isArray(body?.targets) ? body.targets : [];
+      return [...new Set(targets.map((t) => String(t?.name ?? '')).filter(Boolean))].sort();
+    } catch {
+      return [];
+    }
+  },
+
+  async refreshAll(range, target, onStatus) {
+    const target0 = String(target ?? '').trim();
     const [total, sum, count, names, visTotal, visUniques] = await Promise.all([
-      this.rangeQuery('http_requests_total', range, onStatus, 'aggregating throughput…'),
-      this.rangeQuery('http_request_duration_ms_sum', range, onStatus, 'aggregating latency…'),
-      this.rangeQuery('http_request_duration_ms_count', range, onStatus, 'aggregating latency…'),
+      this.rangeQuery(
+        this.targetSelector('http_requests_total', target0),
+        range,
+        onStatus,
+        'aggregating throughput…',
+      ),
+      this.rangeQuery(
+        this.targetSelector('http_request_duration_ms_sum', target0),
+        range,
+        onStatus,
+        'aggregating latency…',
+      ),
+      this.rangeQuery(
+        this.targetSelector('http_request_duration_ms_count', target0),
+        range,
+        onStatus,
+        'aggregating latency…',
+      ),
       (async () => {
         const res = await fetch(`${this.baseUrl}/api/v1/labels`);
         if (!res.ok) return [];
         const body = await res.json();
         return HotReshape.namesFromLabels(body?.data);
       })().catch(() => []),
-      this.rangeQuery('visitors_total', range, onStatus, 'aggregating visitors…').catch(() => ({ result: [] })),
-      this.rangeQuery('unique_visitors_estimate', range, onStatus, 'aggregating visitors…').catch(
-        () => ({ result: [] }),
-      ),
+      this.rangeQuery(
+        this.targetSelector('visitors_total', target0),
+        range,
+        onStatus,
+        'aggregating visitors…',
+      ).catch(() => ({ result: [] })),
+      this.rangeQuery(
+        this.targetSelector('unique_visitors_estimate', target0),
+        range,
+        onStatus,
+        'aggregating visitors…',
+      ).catch(() => ({ result: [] })),
     ]);
     const totalGroups = HotReshape.groupBySeries(total.result);
     const throughput = HotReshape.throughputFromGroups(
@@ -98,7 +146,7 @@ export const HotClient = {
 
   async runCustom(opts, onStatus) {
     const { url, result } = await this.rangeQuery(
-      this.selector(opts.metric, opts.labelKey ?? '', opts.labelValue ?? ''),
+      this.selector(opts.metric, opts.labelKey ?? '', opts.labelValue ?? '', opts.target ?? ''),
       opts.range,
       onStatus,
       `plotting ${opts.metric}…`,

@@ -64,6 +64,7 @@ async function refresh({ reconnect }) {
     // the Advanced source input overrides it for static/remote hosting.
     const source = Controls.getBase() || window.location.origin;
     const range = Controls.getRange();
+    const target = Controls.getTarget();
     if (reconnect || connectedUrl !== source) {
       setStatus('metadata-loading', `connecting to ${source}…`);
       useHot = await HotClient.probe(source).catch(() => false);
@@ -79,17 +80,22 @@ async function refresh({ reconnect }) {
       // single-binary too).
       StatusClient.watch(connectedUrl);
       TargetsClient.watch(connectedUrl);
+      // Populate the target filter from the live data source.
+      const targetNames = useHot
+        ? await HotClient.listTargets().catch(() => [])
+        : await DataSource.listTargets(setStatusCb).catch(() => []);
+      Controls.setTargets(targetNames);
     }
     const data = useHot
-      ? await HotClient.refreshAll(range, setStatusCb)
-      : await DataSource.refreshAll(range, setStatusCb);
+      ? await HotClient.refreshAll(range, target, setStatusCb)
+      : await DataSource.refreshAll(range, target, setStatusCb);
     Cards.render(data.summary, useHot ? HotClient.mode : DataSource.mode);
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);
     Charts.renderVisitors(data.visitors ?? []);
     Controls.setNames(data.names);
-    Controls.setSql(useHot ? `hot: ${HotClient.baseUrl} (query_range)` : Queries.throughputLatency(range));
+    Controls.setSql(useHot ? `hot: ${HotClient.baseUrl} (query_range)` : Queries.throughputLatency(range, target));
   } catch (err) {
     const msg = err?.message ?? String(err);
     const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);

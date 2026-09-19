@@ -319,17 +319,32 @@ controls when the worker picks them up. All state lives in the worker; the
 
 ### Target registry
 
-- `collector.toml` targets are `origin: config`, `mode: recurring`,
-  immutable.
-- Dynamically added targets are `origin: dynamic`, persisted to
-  `state.targets_file` (`data/targets.json`) with an atomic temp+rename on
-  every mutation, and reloaded at worker start. Cap:
+- `collector.toml` targets are `origin: config`, `mode: recurring`. They are
+  overridable at runtime: disabling/removing one records a persisted
+  override (removal is a tombstone), re-enable to revive.
+- Dynamically added targets are `origin: dynamic`. Both dynamic targets and
+  config overrides live in `state.targets_file` (`data/targets.json`) with
+  an atomic temp+rename on every mutation, reloaded at worker start. A
+  legacy bare-array file (dynamic targets only) still loads. Cap:
   `state.max_dynamic_targets` (default 64) → 429.
 - `mode: recurring` targets join the periodic sweep; `mode: once` targets
   are created for the record but only run when enqueued.
 - URLs are http/https, deduped (exact, trimmed); names are unique
   (`scrape_target`), auto-slugged from the host with a `-2` suffix on
   collision.
+- On-disk shape: `{ "targets": [<dynamic>], "overrides": { "cfg:<name>":
+  { "enabled": bool?, "removed": bool } } }`.
+
+### Target filter
+
+The top-bar `targetFilter` narrows the summary cards and every chart to one
+`scrape_target`. It threads through both data paths: cold SQL adds
+`json_extract_string(labels,'$.scrape_target') = '<name>'`
+(`Queries.throughputLatency/errorDistribution/visitorsByRegion/customSeries`),
+hot adds a `scrape_target` matcher to each `query_range` selector. Options
+come from the collector registry (`/api/v1/targets`) when hot, else from
+`Queries.listTargets()` over the Parquet data. The queue panel lists only
+the newest 5 finished jobs (the worker keeps 100).
 
 ### Unified executor (one task)
 

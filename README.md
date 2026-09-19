@@ -57,9 +57,9 @@ Systemd units live in `deploy/`; see
 | GET | `/telemetry/cold/:file` | named cold export, allowlisted to `metrics_cold_*.parquet` |
 | GET | `/api/files` | JSON manifest of cold files (auto-used by the UI) |
 | GET | `/api/v1/query_range` | Prometheus-shaped matrix JSON over recent samples (process lifetime) |
-| GET/POST | `/api/v1/targets` | list / add dynamic targets (`mode: recurring\|once`, multi-URL) |
-| POST | `/api/v1/targets/{id}/enable\|disable` | toggle a dynamic target |
-| DELETE | `/api/v1/targets/{id}` | remove a dynamic target |
+| GET/POST | `/api/v1/targets` | list / add targets (`mode: recurring\|once`, multi-URL) |
+| POST | `/api/v1/targets/{id}/enable\|disable` | toggle a target (config overrides persist) |
+| DELETE | `/api/v1/targets/{id}` | remove a target (config removal persists) |
 | GET/POST/DELETE | `/api/v1/queue` | queue snapshot / enqueue once jobs / clear pending |
 | POST | `/api/v1/queue/pause\|resume` | hold/release manual jobs (recurring keeps running) |
 | DELETE | `/api/v1/queue/{id}` | cancel one pending job |
@@ -69,9 +69,13 @@ Systemd units live in `deploy/`; see
 The dashboard is **frozen to its own collector** by default: the top bar
 shows a connection chip and a **Freeze/Unfreeze** toggle, no source input.
 The **Advanced** toggle reveals the source field for static hosting that
-points at a remote Parquet host (empty = this page's own origin). Mutations
-run in a single worker executor (manual jobs first, one at a time); when
-`control_token` is set they require an `x-control-token` header. Errors:
+points at a remote Parquet host (empty = this page's own origin). The
+**target filter** next to the range selector scopes the summary cards and
+all charts to one scrape target. The **Targets & queue** panel adds/removes
+targets (config targets included; removal persists as an override) and
+shows the 5 most recent queue runs. Mutations run in a single worker
+executor (manual jobs first, one at a time); when `control_token` is set
+they require an `x-control-token` header. Errors:
 422 bad input · 429 queue/target cap · 404 unknown id · 401 bad token.
 
 `query_range` params: `query` (exact name or `{__name__="x",k="v"}` with

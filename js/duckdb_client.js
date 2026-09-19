@@ -83,11 +83,11 @@ export const DataSource = {
     return { urls, mode: this.mode };
   },
 
-  async refreshAll(range, onStatus) {
-    const throughputSql = Queries.throughputLatency(range);
-    const errorsSql = Queries.errorDistribution(range);
+  async refreshAll(range, target, onStatus) {
+    const throughputSql = Queries.throughputLatency(range, target);
+    const errorsSql = Queries.errorDistribution(range, target);
     const namesSql = Queries.listMetricNames();
-    const visitorsSql = Queries.visitorsByRegion(range);
+    const visitorsSql = Queries.visitorsByRegion(range, target);
     const [tRows, eRows, nRows, vRows] = await Promise.all([
       WorkerEngine.query(throughputSql, onStatus, 'aggregating throughput + latency…'),
       WorkerEngine.query(errorsSql, onStatus, 'aggregating error distribution…'),
@@ -100,6 +100,16 @@ export const DataSource = {
     const visitors = vRows.map(normVisitorRow);
     const bucketSecs = Queries.Ranges[range]?.bucketSecs ?? 3600;
     return { throughput, errors, names, visitors, summary: this.summarize(throughput, errors, bucketSecs) };
+  },
+
+  /// Distinct `scrape_target` values for the target filter (cold path).
+  async listTargets(onStatus) {
+    try {
+      const rows = await WorkerEngine.query(Queries.listTargets(), onStatus, 'listing targets…');
+      return rows.map((r) => String(r.target)).filter(Boolean).sort();
+    } catch {
+      return [];
+    }
   },
 
   async runCustom(opts, onStatus) {

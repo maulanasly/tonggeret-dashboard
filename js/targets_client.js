@@ -61,6 +61,13 @@ export const TargetsClient = {
     return { text: 'queue idle', status: 'ok' };
   },
 
+  /// Newest `limit` finished jobs for display (backend keeps a longer
+  /// history; the panel shows only the most recent few).
+  recentRuns(queue, limit = 5) {
+    const recent = Array.isArray(queue?.recent) ? queue.recent : [];
+    return recent.slice(0, limit);
+  },
+
   loadToken() {
     try {
       return localStorage.getItem(TOKEN_KEY) ?? '';
@@ -82,15 +89,21 @@ export const TargetsClient = {
     document.getElementById(id)?.addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-action]');
       if (!btn) return;
-      const { action, id: rowId, url } = btn.dataset;
-      this.act(() => this.dispatch(action, rowId, url));
+      const { action, id: rowId, url, name } = btn.dataset;
+      this.act(() => this.dispatch(action, rowId, url, name));
     });
   },
 
-  async dispatch(action, id, url) {
+  async dispatch(action, id, url, name) {
     if (action === 'enable') return this.setEnabled(id, true);
     if (action === 'disable') return this.setEnabled(id, false);
-    if (action === 'remove') return this.remove(id);
+    if (action === 'remove') {
+      // Config targets are tombstoned (persisted); confirm to avoid accidents.
+      if (typeof window.confirm === 'function' && !window.confirm(`Remove target ${name || id}?`)) {
+        return;
+      }
+      return this.remove(id);
+    }
     if (action === 'enqueue') return this.enqueue([url]);
     if (action === 'cancel') return this.cancel(id);
     throw new Error(`unknown action ${action}`);
@@ -255,13 +268,10 @@ export const TargetsClient = {
     const esc = (s) => this.esc(s);
     el.innerHTML = list
       .map((t) => {
-        const dynamic = t.origin === 'dynamic';
         const buttons =
-          `<button class="btn tiny" data-action="enqueue" data-url="${esc(t.url)}" title="Run now">run</button>` +
-          (dynamic
-            ? `<button class="btn tiny" data-action="${t.enabled ? 'disable' : 'enable'}" data-id="${esc(t.id)}">${t.enabled ? 'disable' : 'enable'}</button>` +
-              `<button class="btn tiny danger" data-action="remove" data-id="${esc(t.id)}">remove</button>`
-            : '');
+          `<button class="btn tiny" data-action="enqueue" data-url="${esc(t.url)}" data-name="${esc(t.name)}" title="Run now">run</button>` +
+          `<button class="btn tiny" data-action="${t.enabled ? 'disable' : 'enable'}" data-id="${esc(t.id)}" data-name="${esc(t.name)}">${t.enabled ? 'disable' : 'enable'}</button>` +
+          `<button class="btn tiny danger" data-action="remove" data-id="${esc(t.id)}" data-name="${esc(t.name)}">remove</button>`;
         return (
           `<div class="target-row">` +
           `<span class="target-name">${esc(t.name)}</span>` +
@@ -300,8 +310,7 @@ export const TargetsClient = {
           `<button class="btn tiny danger" data-action="cancel" data-id="${esc(j.id)}">cancel</button></div>`,
       )
       .join('');
-    const recent = (queue.recent ?? [])
-      .slice(0, 10)
+    const recent = this.recentRuns(queue)
       .map(
         (j) =>
           `<div class="queue-row done"><span class="queue-state" data-state="${esc(j.state)}">${esc(j.state)}</span>` +
