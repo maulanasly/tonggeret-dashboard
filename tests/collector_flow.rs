@@ -86,7 +86,7 @@ async fn scrape_flows_to_registry_and_cold_parquet() {
     assert!(
         files
             .iter()
-            .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false)),
+            .any(|e| e.metadata().is_ok_and(|m| m.len() > 0)),
         "expected a non-empty export"
     );
     tonggeret::shutdown().unwrap();

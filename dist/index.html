@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>duckmetrics-dashboard — client-side telemetry</title>
+  <title>tonggeret-dashboard — client-side telemetry</title>
   <meta
     name="description"
-    content="Zero-server-query dashboard for duckmetrics Fjall/Parquet exports. DuckDB-Wasm in your browser queries remote Parquet over HTTP."
+    content="Zero-server-query dashboard for tonggeret Fjall/Parquet exports. DuckDB-Wasm in your browser queries remote Parquet over HTTP."
   />
   <style>
 :root {
@@ -213,14 +213,14 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   </script>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/dist/umd/lucide.min.js" defer></script>
-<!-- bundled: npm run build (duckmetrics-dashboard) -->
+<!-- bundled: npm run build (tonggeret-dashboard) -->
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <i data-lucide="activity" class="brand-icon"></i>
       <div>
-        <h1>duckmetrics-dashboard</h1>
+        <h1>tonggeret-dashboard</h1>
         <p class="subtitle">browser-side analytics over <code>/telemetry/parquet</code></p>
       </div>
     </div>
@@ -347,9 +347,9 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 import * as duckdb from '@duckdb/duckdb-wasm';
 
 /* ---- js/queries.js ---- */
-//! Analytical SQL builders for the duckmetrics Parquet consumption contract.
+//! Analytical SQL builders for the tonggeret Parquet consumption contract.
 //!
-//! Cold export schema (see duckmetrics `parquet_exporter.rs`):
+//! Cold export schema (see tonggeret `parquet_exporter.rs`):
 //! `ts Timestamp(Microsecond)`, `name Utf8`, `value Float64`,
 //! `metric_type Utf8`, `labels Utf8` (JSON object string).
 //!
@@ -692,7 +692,7 @@ const DataSource = {
   /// Resolve free-form user input to Parquet file URL(s).
   /// - `…/x.parquet` → that file directly.
   /// - otherwise → `<base>/api/files` manifest if present,
-  ///   else `<base>/telemetry/parquet` (duckmetrics file route).
+  ///   else `<base>/telemetry/parquet` (tonggeret file route).
   async resolveInput(input) {
     const trimmed = input.trim().replace(/\/$/, '');
     if (trimmed === '') throw new Error('empty data source URL');
