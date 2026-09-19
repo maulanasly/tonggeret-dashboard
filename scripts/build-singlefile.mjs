@@ -5,10 +5,11 @@
 //   Rules the bundler relies on (kept true by construction):
 //   * one named export object per module, no default/circular imports;
 //   * relative imports use `import { X } from './y.js'` (stripped at bundle);
-//   * bare-specifier imports (CDN importmap) are deduped, first wins.
-// - CDN <script src> tags (echarts, lucide) and the importmap stay remote:
-//   WASM binaries (~MBs) must not be base64-inlined.
-// - dist/index.html is committable and Rust-embeddable via include_str!().
+//   * bare-specifier imports (local importmap) are deduped, first wins.
+// - Copies vendor/ (self-hosted DuckDB-Wasm, Arrow, ECharts, Lucide) to
+//   dist/vendor/ as files: the WASM binaries are MBs and must not be
+//   inlined; the importmap + script tags reference them relatively.
+// - dist/ is fully offline-capable: no remote URLs remain (verified below).
 //
 // Usage: npm run build
 
@@ -55,7 +56,7 @@ function stripModule(src) {
     src
       .split('\n')
       // Drop every static import line: relative imports are inlined below,
-      // bare-specifier (CDN importmap) imports are re-emitted once at the top.
+      // bare-specifier (local importmap) imports are re-emitted once at the top.
       .filter((line) => !REL_IMPORT.test(line))
       .join('\n')
       // `export const X` -> `const X` (same for function/class/async).
@@ -109,3 +110,15 @@ html = html.replace('</head>', '<!-- bundled: npm run build (tonggeret-dashboard
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
 fs.writeFileSync(OUT, html);
 console.log(`wrote ${OUT} (${(fs.statSync(OUT).size / 1024).toFixed(1)} KiB)`);
+
+// Copy self-hosted vendor assets alongside (never inlined: MBs of WASM).
+// dist/ stays fully offline-capable; fail loudly if any *loaded* resource
+// (script/src/href/import, not placeholder text) still points remote.
+fs.rmSync(path.join(ROOT, 'dist', 'vendor'), { recursive: true, force: true });
+fs.cpSync(path.join(ROOT, 'vendor'), path.join(ROOT, 'dist', 'vendor'), { recursive: true });
+const remoteRefs =
+  html.match(/(?:src|href)\s*=\s*"https?:\/\/[^"<>]+|(?:from|import\()\s*["']https?:\/\/[^"'<>]+/g) ?? [];
+if (remoteRefs.length > 0) {
+  throw new Error(`dist/index.html still loads remote URLs: ${remoteRefs.slice(0, 5).join(', ')}`);
+}
+console.log('vendor copied to dist/vendor (offline-capable, no remote loads)');

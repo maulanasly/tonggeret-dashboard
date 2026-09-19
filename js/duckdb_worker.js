@@ -55,8 +55,21 @@ export const WorkerEngine = {
   /// Boot the WASM runtime inside a worker thread. Idempotent.
   async init(onStatus) {
     if (this._db) return this._db;
-    emit(onStatus, EnginePhases.WASM_LOADING, 'downloading duckdb-wasm bundle…');
-    const bundles = duckdb.getJsDelivrBundles();
+    emit(onStatus, EnginePhases.WASM_LOADING, 'loading duckdb-wasm bundle…');
+    // Self-hosted MVP-only bundles (vendor/duckdb). Absolute URLs derived
+    // from the page so dev (index.html) and the dist/ bundle resolve
+    // identically; the blob-worker importScripts below needs absolute URLs.
+    // MVP-only is deliberate: our servers send no COOP/COEP headers, so
+    // SharedArrayBuffer is unavailable and selectBundle would pick MVP
+    // anyway (verified in the vendored source); eh/coi builds omitted.
+    const vendorBase = new URL('vendor/duckdb/', document.baseURI);
+    const file = (name) => new URL(name, vendorBase).href;
+    const bundles = {
+      mvp: {
+        mainModule: file('duckdb-mvp.wasm'),
+        mainWorker: file('duckdb-browser-mvp.worker.js'),
+      },
+    };
     const bundle = await duckdb.selectBundle(bundles);
     const workerUrl = URL.createObjectURL(
       new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }),

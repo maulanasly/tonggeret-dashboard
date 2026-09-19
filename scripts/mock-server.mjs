@@ -26,6 +26,7 @@ const MIME = {
   '.mjs': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.parquet': 'application/vnd.apache.parquet',
+  '.wasm': 'application/wasm',
   '.txt': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
 };
