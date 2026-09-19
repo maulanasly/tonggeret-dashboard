@@ -7,6 +7,17 @@ of history to Parquet, and serves a client-side dashboard (**DuckDB-Wasm
 runs in a Web Worker inside your browser** and queries the cold Parquet
 over HTTP range requests).
 
+## How it works
+
+Scrape targets → collector (allowlist → dual write: Prometheus mirror +
+Fjall hot store + 20k-sample hot ring) → hourly compaction to
+`metrics_cold_*.parquet` (30d) → serve UI + `/metrics` + telemetry APIs.
+The dashboard has two modes: **hot** (`/api/v1/query_range` JSON, fresh
+within seconds, p99 unavailable) and **cold** (DuckDB-Wasm over Parquet,
+full history). Full data flow, component map, lifecycle numbers, and
+request walkthroughs: [`docs/architecture.md`](docs/architecture.md).
+Day-to-day commands: `make help` (`make gate` runs the whole check suite).
+
 ## Quickstart (collector)
 
 ```sh
