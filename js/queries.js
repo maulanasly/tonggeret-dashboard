@@ -83,6 +83,26 @@ export const Queries = {
     return 'SELECT DISTINCT name FROM metrics_all ORDER BY 1 LIMIT 200';
   },
 
+  /// Visitor preset: latest `visitors_total` and `unique_visitors_estimate`
+  /// per bucket, grouped by target + region. Both are read as latest
+  /// (`arg_max(value, ts)`): the uniques estimate is a gauge and must
+  /// never be summed — take latest per `(target, region)`.
+  visitorsByRegion(range) {
+    const filter = timeFilter(range);
+    const bucket = bucketExpr(range);
+    return (
+      `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
+      `  COALESCE(NULLIF(json_extract_string(labels, '$.scrape_target'), ''), '(unknown)') AS target,\n` +
+      `  COALESCE(NULLIF(json_extract_string(labels, '$.region'), ''), '(unknown)') AS region,\n` +
+      `  arg_max(value, ts) FILTER (WHERE name = 'visitors_total') AS visitors,\n` +
+      `  arg_max(value, ts) FILTER (WHERE name = 'unique_visitors_estimate') AS uniques\n` +
+      `FROM metrics_all\n` +
+      `WHERE name IN ('visitors_total', 'unique_visitors_estimate') AND ${filter}\n` +
+      `GROUP BY 1, 2, 3\n` +
+      `ORDER BY 1, 2, 3`
+    );
+  },
+
   /// General-purpose counter/gauge series builder.
   ///
   /// `opts`: `{ metric, agg, labelKey, labelValue, range }`.

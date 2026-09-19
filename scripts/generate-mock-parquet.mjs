@@ -5,7 +5,8 @@
 //
 // Engine preference: node `duckdb` package (npm i -D duckdb) → python3+duckdb
 // fallback. 72h of 5-minute buckets: request counters with a 5xx spike,
-// latency histograms, plus orders_total / queue_depth business series.
+// latency histograms, orders_total / queue_depth business series, plus
+// visitors_total (counter) / unique_visitors_estimate (gauge) per region.
 //
 // Usage: npm run gen-mock [-- --rows-scale 1 --out <file>]
 
@@ -61,8 +62,23 @@ COPY (
     SELECT b.bkt AS ts, 'queue_depth' AS name, (20 + 15*sin(extract(epoch FROM b.bkt)/3600.0) + random()*6)::DOUBLE AS value,
       'gauge' AS metric_type, '{"region":"eu"}' AS labels
     FROM buckets b
+  ),
+  vis AS (
+    SELECT b.bkt AS ts, 'visitors_total' AS name,
+      (SUM(5 + CAST(floor(random()*20) AS INTEGER)) OVER (PARTITION BY r.region ORDER BY b.bkt ROWS UNBOUNDED PRECEDING))::DOUBLE AS value,
+      'counter' AS metric_type,
+      '{"region":"' || r.region || '","scrape_target":"mock"}' AS labels
+    FROM buckets b CROSS JOIN (VALUES ('DE'), ('US')) AS r(region)
+  ),
+  uniq AS (
+    SELECT b.bkt AS ts, 'unique_visitors_estimate' AS name,
+      (120 + 40*sin(extract(epoch FROM b.bkt)/86400.0*6.283) + random()*10)::DOUBLE AS value,
+      'gauge' AS metric_type,
+      '{"region":"' || r.region || '","scrape_target":"mock"}' AS labels
+    FROM buckets b CROSS JOIN (VALUES ('DE'), ('US')) AS r(region)
   )
   SELECT * FROM req UNION ALL SELECT * FROM lat UNION ALL SELECT * FROM biz UNION ALL SELECT * FROM gauge
+    UNION ALL SELECT * FROM vis UNION ALL SELECT * FROM uniq
 ) TO '${out.replaceAll("'", "''")}' (FORMAT PARQUET, COMPRESSION ZSTD);
 `;
 

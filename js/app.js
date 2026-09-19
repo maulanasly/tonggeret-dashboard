@@ -67,6 +67,7 @@ async function refresh({ reconnect }) {
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);
+    Charts.renderVisitors(data.visitors ?? []);
     Controls.setNames(data.names);
     Controls.setSql(Queries.throughputLatency(range));
   } catch (err) {

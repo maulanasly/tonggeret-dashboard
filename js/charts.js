@@ -68,7 +68,7 @@ export const Charts = {
 
   init() {
     if (!available()) return false;
-    for (const id of ['chartThroughput', 'chartLatency', 'chartErrors', 'chartCustom']) {
+    for (const id of ['chartThroughput', 'chartLatency', 'chartErrors', 'chartVisitors', 'chartCustom']) {
       const el = document.getElementById(id);
       if (el) {
         this._els[id] = getChart(el);
@@ -207,6 +207,62 @@ export const Charts = {
             itemStyle: { color: BAD },
           },
         ],
+      },
+      true,
+    );
+  },
+
+  renderVisitors(rows) {
+    const chart = this._els.chartVisitors;
+    if (!chart) return;
+    const present = rows.filter((r) => r.visitors != null || r.uniques != null);
+    if (present.length === 0) {
+      chart.setOption(emptyOption('no visitor metrics in range — this app has no visitor instrumentation'), true);
+      return;
+    }
+    const groups = new Map();
+    for (const r of present) {
+      const key = `${r.target} / ${r.region}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    const palette = [ACCENT, ACCENT2, '#34d399', WARN, BAD];
+    let i = 0;
+    const series = [];
+    for (const [key, rs] of groups) {
+      const color = palette[i++ % palette.length];
+      series.push({
+        name: `${key} uniques`,
+        type: 'line',
+        showSymbol: false,
+        sampling: 'lttb',
+        smooth: 0.15,
+        data: rs.filter((r) => r.uniques != null).map((r) => [msOf(r.bucket_us), r.uniques]),
+        lineStyle: { width: 2, color },
+      });
+      series.push({
+        name: `${key} total`,
+        type: 'line',
+        showSymbol: false,
+        sampling: 'lttb',
+        smooth: 0.15,
+        data: rs.filter((r) => r.visitors != null).map((r) => [msOf(r.bucket_us), r.visitors]),
+        lineStyle: { width: 1.5, type: 'dashed', color },
+      });
+    }
+    chart.setOption(
+      {
+        ...baseOption(),
+        tooltip: tooltipBase(),
+        legend: { textStyle: { color: AXIS }, top: 0 },
+        grid: { left: 56, right: 16, top: 36, bottom: 30 },
+        xAxis: { type: 'time', axisLabel: { color: AXIS } },
+        yAxis: {
+          type: 'value',
+          splitLine: { lineStyle: { color: SPLIT } },
+          axisLabel: { color: AXIS },
+        },
+        series,
       },
       true,
     );

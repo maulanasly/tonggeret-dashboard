@@ -59,6 +59,23 @@ describe('listMetricNames', () => {
   });
 });
 
+describe('visitorsByRegion', () => {
+  it('reads both visitor series grouped by target + region', () => {
+    const sql = Queries.visitorsByRegion('24h');
+    assert.match(sql, /name IN \('visitors_total', 'unique_visitors_estimate'\)/);
+    assert.match(sql, /\$\.scrape_target/);
+    assert.match(sql, /\$\.region/);
+    assert.match(sql, /GROUP BY 1, 2, 3/);
+    assert.match(sql, /INTERVAL 24 HOUR/);
+  });
+
+  it('takes latest per bucket, never sums the uniques gauge', () => {
+    const sql = Queries.visitorsByRegion('all');
+    assert.match(sql, /arg_max\(value, ts\) FILTER \(WHERE name = 'unique_visitors_estimate'\)/);
+    assert.doesNotMatch(sql, /sum\(value\)/);
+  });
+});
+
 describe('customSeries', () => {
   it('supports every documented aggregation', () => {
     for (const [agg, fragment] of [
