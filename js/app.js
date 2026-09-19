@@ -89,7 +89,8 @@ async function refresh({ reconnect }) {
     const data = useHot
       ? await HotClient.refreshAll(range, target, setStatusCb)
       : await DataSource.refreshAll(range, target, setStatusCb);
-    Cards.render(data.summary, useHot ? HotClient.mode : DataSource.mode);
+    const mode = useHot ? HotClient.coverageLabel(data.coveredSecs, range) : DataSource.mode;
+    Cards.render(data.summary, mode);
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);

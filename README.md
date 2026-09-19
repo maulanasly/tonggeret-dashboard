@@ -98,7 +98,8 @@ Otherwise it falls back to cold Parquet via DuckDB-Wasm (range requests or
 full fetch). The mode badge shows `via query-range` or the Parquet access
 mode. Hot-mode approximations (documented, display-only):
 
-- steps track the scrape cadence (`1h`→15s, `24h`→5m, all→10m); counter
+- steps are derived from the recent-buffer span, so wide ranges still show
+  the covered window (the badge reads `via query-range · last Ns`); counter
   charts need two scrapes before the first bucket appears;
 - throughput = per-series counter diffs (restarts clamp to 0), latency avg
   = sum/count diffs, **p99 is absent hot** (no histogram math in the client);

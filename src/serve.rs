@@ -33,7 +33,7 @@ use tower::ServiceExt as _;
 
 use crate::query::{self, QueryError, RecentBuffer};
 use crate::queue::{JobQueue, QueueError, QueueSummary};
-use crate::status::{QueueInfo, StatusSnapshot, StatusTracker};
+use crate::status::{BufferInfo, QueueInfo, StatusSnapshot, StatusTracker};
 use crate::targets::{Mode, Target, TargetError, TargetRegistry};
 
 /// Cold export filename shape (`tonggeret::storage` convention).
@@ -225,11 +225,16 @@ struct StatusCtx {
 /// `GET /api/v1/status` — worker health snapshot (see [`crate::status`]).
 async fn collector_status(State(ctx): State<StatusCtx>) -> Json<StatusSnapshot> {
     let (samples, cap) = ctx.buffer.occupancy();
+    let span = ctx.buffer.span();
     let cold_files = list_cold_files(ctx.cold_dir.as_path()).len();
     let q = ctx.queue.snapshot();
     Json(ctx.tracker.snapshot(
-        samples,
-        cap,
+        BufferInfo {
+            samples,
+            cap,
+            oldest_ts: span.map(|(oldest, _)| oldest / 1_000_000),
+            newest_ts: span.map(|(_, newest)| newest / 1_000_000),
+        },
         cold_files,
         QueueInfo {
             depth: q.depth,
@@ -955,6 +960,9 @@ mod tests {
         assert_eq!(body["retention_days"], 30);
         assert_eq!(body["buffer"]["samples"], 1);
         assert_eq!(body["buffer"]["cap"], 100);
+        // Seeded at 1_700_000_000_000_000 micros → 1_700_000_000 seconds.
+        assert_eq!(body["buffer"]["oldest_ts"], 1_700_000_000_u64);
+        assert_eq!(body["buffer"]["newest_ts"], 1_700_000_000_u64);
         assert_eq!(body["cold_files"], 1);
         assert_eq!(body["targets"][0]["name"], "app");
         assert_eq!(body["targets"][0]["last_status"], "ok");

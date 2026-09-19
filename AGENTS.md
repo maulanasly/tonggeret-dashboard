@@ -97,6 +97,13 @@ data/            LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history) 
   hot). Options come from `/api/v1/targets` when hot, else
   `Queries.listTargets()`. Queue "recent" shows only the newest 5 (backend
   keeps 100).
+- **Hot-mode step is buffer-relative (load-bearing).** The recent buffer is
+  bounded and often far shorter than the selected range. `HotReshape.plan`
+  zooms the query window to the covered span and derives the step from it
+  (`max(15s, span/240)`), retrying wider on the server point-limit error —
+  a step coarser than the span collapses counter diffs to zero. `buffer.
+  oldest_ts/newest_ts` in `/api/v1/status` feed this; don't reintroduce fixed
+  per-range steps.
 - **Frozen connection.** The dashboard binds to `window.location.origin` by
   default (no source input); the top bar is a connection chip + freeze
   toggle. The Advanced toggle reveals the source field for static hosting;

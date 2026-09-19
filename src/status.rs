@@ -42,6 +42,23 @@ pub struct BufferInfo {
     pub samples: usize,
     /// Ring capacity (`recent_buffer_samples`).
     pub cap: usize,
+    /// Unix seconds of the oldest buffered sample (`null` when empty).
+    pub oldest_ts: Option<u64>,
+    /// Unix seconds of the newest buffered sample (`null` when empty).
+    pub newest_ts: Option<u64>,
+}
+
+impl BufferInfo {
+    /// Occupancy without timestamps (tests / callers that lack a span).
+    #[must_use]
+    pub fn new(samples: usize, cap: usize) -> Self {
+        Self {
+            samples,
+            cap,
+            oldest_ts: None,
+            newest_ts: None,
+        }
+    }
 }
 
 /// Job-queue health for the status payload.
@@ -221,12 +238,11 @@ impl StatusTracker {
     }
 
     /// Snapshot with the worker-owned figures the scrape path cannot know
-    /// (buffer occupancy, cold-file count, queue health).
+    /// (buffer occupancy + span, cold-file count, queue health).
     #[must_use]
     pub fn snapshot(
         &self,
-        buffer_samples: usize,
-        buffer_cap: usize,
+        buffer: BufferInfo,
         cold_files: usize,
         queue: QueueInfo,
     ) -> StatusSnapshot {
@@ -251,10 +267,7 @@ impl StatusTracker {
             status,
             uptime_secs: now_unix().saturating_sub(self.started_unix),
             interval_secs: self.interval_secs,
-            buffer: BufferInfo {
-                samples: buffer_samples,
-                cap: buffer_cap,
-            },
+            buffer,
             cold_files,
             retention_days: self.retention_days,
             queue,
@@ -299,12 +312,12 @@ mod tests {
             target("b", "b", Mode::Recurring),
         ];
         let t = StatusTracker::new(&targets, 15, 30);
-        let snap = t.snapshot(0, 20_000, 0, queue_info());
+        let snap = t.snapshot(BufferInfo::new(0, 20_000), 0, queue_info());
         assert_eq!(snap.status, STATUS_STARTING);
         assert_eq!(snap.targets.len(), 2);
 
         t.record("a", ScrapeStatus::Ok, 5, 12);
-        let snap = t.snapshot(5, 20_000, 1, queue_info());
+        let snap = t.snapshot(BufferInfo::new(5, 20_000), 1, queue_info());
         assert_eq!(snap.status, STATUS_STARTING, "b still unscraped");
         assert_eq!(snap.targets[0].last_status.as_deref(), Some("ok"));
         assert_eq!(snap.targets[0].last_samples, 5);
@@ -313,7 +326,10 @@ mod tests {
         assert_eq!(snap.cold_files, 1);
 
         t.record("b", ScrapeStatus::Ok, 3, 7);
-        assert_eq!(t.snapshot(0, 1, 0, queue_info()).status, STATUS_OK);
+        assert_eq!(
+            t.snapshot(BufferInfo::new(0, 1), 0, queue_info()).status,
+            STATUS_OK
+        );
     }
 
     #[test]
@@ -325,7 +341,7 @@ mod tests {
         let t = StatusTracker::new(&targets, 15, 30);
         t.record("a", ScrapeStatus::Ok, 1, 1);
         assert_eq!(
-            t.snapshot(0, 1, 0, queue_info()).status,
+            t.snapshot(BufferInfo::new(0, 1), 0, queue_info()).status,
             STATUS_OK,
             "unscraped once targets are not part of the sweep"
         );
@@ -342,19 +358,19 @@ mod tests {
         t.record("b", ScrapeStatus::Ok, 1, 1);
 
         t.record("a", ScrapeStatus::FetchError, 0, 5);
-        let snap = t.snapshot(0, 1, 0, queue_info());
+        let snap = t.snapshot(BufferInfo::new(0, 1), 0, queue_info());
         assert_eq!(snap.status, STATUS_DEGRADED);
         assert_eq!(snap.targets[0].consecutive_failures, 1);
         assert_eq!(snap.targets[0].totals.fetch_error, 1);
 
         t.record("a", ScrapeStatus::ParseError, 0, 5);
         assert_eq!(
-            t.snapshot(0, 1, 0, queue_info()).targets[0].consecutive_failures,
+            t.snapshot(BufferInfo::new(0, 1), 0, queue_info()).targets[0].consecutive_failures,
             2
         );
 
         t.record("a", ScrapeStatus::Ok, 2, 5);
-        let snap = t.snapshot(0, 1, 0, queue_info());
+        let snap = t.snapshot(BufferInfo::new(0, 1), 0, queue_info());
         assert_eq!(snap.status, STATUS_OK);
         assert_eq!(snap.targets[0].consecutive_failures, 0);
         assert_eq!(snap.targets[0].totals.ok, 2);
@@ -366,7 +382,7 @@ mod tests {
         let targets = vec![target("a", "a", Mode::Recurring)];
         let t = StatusTracker::new(&targets, 15, 30);
         t.record("nope", ScrapeStatus::Ok, 1, 1);
-        let snap = t.snapshot(0, 1, 0, queue_info());
+        let snap = t.snapshot(BufferInfo::new(0, 1), 0, queue_info());
         assert!(snap.targets.iter().all(|s| s.last_scrape_ts.is_none()));
     }
 
@@ -376,10 +392,20 @@ mod tests {
         let t = StatusTracker::new(&targets, 15, 30);
         let b = target("b", "b", Mode::Recurring);
         t.add_target(&b);
-        assert_eq!(t.snapshot(0, 1, 0, queue_info()).targets.len(), 2);
+        assert_eq!(
+            t.snapshot(BufferInfo::new(0, 1), 0, queue_info())
+                .targets
+                .len(),
+            2
+        );
         t.set_enabled("b", false);
-        assert!(!t.snapshot(0, 1, 0, queue_info()).targets[1].enabled);
+        assert!(!t.snapshot(BufferInfo::new(0, 1), 0, queue_info()).targets[1].enabled);
         t.remove_target("b");
-        assert_eq!(t.snapshot(0, 1, 0, queue_info()).targets.len(), 1);
+        assert_eq!(
+            t.snapshot(BufferInfo::new(0, 1), 0, queue_info())
+                .targets
+                .len(),
+            1
+        );
     }
 }
