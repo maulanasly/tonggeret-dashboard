@@ -2,7 +2,9 @@ node_modules/
 .DS_Store
 scripts/.gen.sql.tmp
 # Rust collector build + local hot/cold state (never commit telemetry data).
+# NOTE: no parens/alternation — gitignore treats them literally.
 /target/
-(data|data-*)/
+/data/
+/data-*/
 *.db
 *.db.wal
