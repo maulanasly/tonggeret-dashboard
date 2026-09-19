@@ -1,0 +1,39 @@
+# Collector + dashboard gate (mirrors AGENTS.md workflow).
+#
+# - rust: clippy (deny warnings), rustfmt check, unit + e2e tests, audit.
+#   `paste`/`lexical-core` are upstream informational advisories, ignored.
+# - web: node syntax check, SQL-builder smoke tests, single-file build,
+#   and a drift check proving dist/index.html matches js/ + index.html.
+
+name: gate
+
+on: [push, pull_request]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+      - run: cargo test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2023-0086
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node --check js/*.js js/components/*.js
+      - run: npm test
+      - run: npm run build
+      - run: git diff --exit-code dist/
