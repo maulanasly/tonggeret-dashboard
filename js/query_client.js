@@ -5,7 +5,7 @@
 //!
 //! `summarize` is intentionally duplicated from `duckdb_client.js` (kept
 //! local so this module imports nothing but the DOM-free reshaper —
-//! `duckdb_client.js` pulls the CDN WASM import, which Node cannot load).
+//! `duckdb_client.js` pulls the vendor WASM import, which Node cannot load).
 
 import { HotReshape } from './hot_reshape.js';
 

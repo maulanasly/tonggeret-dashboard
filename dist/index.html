@@ -206,13 +206,13 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   <script type="importmap">
     {
       "imports": {
-        "@duckdb/duckdb-wasm": "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm",
-        "apache-arrow": "https://cdn.jsdelivr.net/npm/apache-arrow@16.1.0/+esm"
+        "@duckdb/duckdb-wasm": "./vendor/duckdb/duckdb-browser.mjs",
+        "apache-arrow": "./vendor/arrow/Arrow.mjs"
       }
     }
   </script>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/dist/umd/lucide.min.js" defer></script>
+  <script src="./vendor/echarts.min.js" defer></script>
+  <script src="./vendor/lucide.min.js" defer></script>
 <!-- bundled: npm run build (tonggeret-dashboard) -->
 </head>
 <body>
@@ -565,8 +565,21 @@ const WorkerEngine = {
   /// Boot the WASM runtime inside a worker thread. Idempotent.
   async init(onStatus) {
     if (this._db) return this._db;
-    emit(onStatus, EnginePhases.WASM_LOADING, 'downloading duckdb-wasm bundle…');
-    const bundles = duckdb.getJsDelivrBundles();
+    emit(onStatus, EnginePhases.WASM_LOADING, 'loading duckdb-wasm bundle…');
+    // Self-hosted MVP-only bundles (vendor/duckdb). Absolute URLs derived
+    // from the page so dev (index.html) and the dist/ bundle resolve
+    // identically; the blob-worker importScripts below needs absolute URLs.
+    // MVP-only is deliberate: our servers send no COOP/COEP headers, so
+    // SharedArrayBuffer is unavailable and selectBundle would pick MVP
+    // anyway (verified in the vendored source); eh/coi builds omitted.
+    const vendorBase = new URL('vendor/duckdb/', document.baseURI);
+    const file = (name) => new URL(name, vendorBase).href;
+    const bundles = {
+      mvp: {
+        mainModule: file('duckdb-mvp.wasm'),
+        mainWorker: file('duckdb-browser-mvp.worker.js'),
+      },
+    };
     const bundle = await duckdb.selectBundle(bundles);
     const workerUrl = URL.createObjectURL(
       new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }),
@@ -1026,7 +1039,7 @@ const HotReshape = {
 //!
 //! `summarize` is intentionally duplicated from `duckdb_client.js` (kept
 //! local so this module imports nothing but the DOM-free reshaper —
-//! `duckdb_client.js` pulls the CDN WASM import, which Node cannot load).
+//! `duckdb_client.js` pulls the vendor WASM import, which Node cannot load).
 
 
 function emit(onStatus, phase, detail) {
@@ -1134,7 +1147,7 @@ const HotClient = {
 
 /* ---- js/charts.js ---- */
 //! ECharts wrappers: dark-theme time-series + error charts with graceful
-//! empty/loading states. Expects `window.echarts` from the CDN script tag.
+//! empty/loading states. Expects `window.echarts` from the vendor script tag.
 //! uPlot can replace these renderers later without touching callers.
 
 const AXIS = '#8b93a7';
@@ -1190,7 +1203,7 @@ function available() {
 
 function getChart(el) {
   if (!available()) {
-    el.innerHTML = '<div class="chart-fallback">chart library (CDN) failed to load</div>';
+    el.innerHTML = '<div class="chart-fallback">chart library failed to load</div>';
     return null;
   }
   const existing = window.echarts.getInstanceByDom(el);

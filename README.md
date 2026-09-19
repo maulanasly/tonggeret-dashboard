@@ -147,10 +147,12 @@ dist/index.html             # single-file artifact: S3/CDN or Rust embed
 npm run build   # → dist/index.html
 ```
 
-`dist/index.html` inlines all CSS/JS; only CDN URLs stay remote
-(`@duckdb/duckdb-wasm`, `apache-arrow`, `echarts`, `lucide-static` — WASM
-binaries are MBs and must not be base64-inlined). Host it on any static
-S3/CDN, or embed it in Rust:
+`dist/index.html` inlines all CSS/JS and ships with `dist/vendor/`
+(self-hosted DuckDB-Wasm MVP, Arrow, ECharts, Lucide — WASM binaries are
+MBs and are copied as files, never inlined). The bundle is fully
+offline-capable: `npm run build` fails if any loaded resource still points
+remote. Host the `dist/` directory on any static server (it must serve
+`index.html` + `vendor/` together), or embed it in Rust:
 
 ```rust
 const DASHBOARD_HTML: &str = include_str!("../../dashboard/dist/index.html");
@@ -192,7 +194,9 @@ Arrow BigInt handling unambiguous.
   exports keys older than `retention` (default 24h). Use `npm run gen-mock`.
 * `query failed … HTTP 4xx/5xx` + CORS hint — file exists but CORS/Range is
   missing (see above), or the URL is wrong.
-* `wasm init failed` — CDN blocked (offline). The app needs network for the
-  WASM + chart CDNs on first load.
+* `wasm init failed` — `dist/vendor/` not served alongside `dist/index.html`
+  (the WASM + worker must resolve under `vendor/` relative to the page), or
+  the browser blocks WebAssembly. No network is needed: all frontend deps
+  are self-hosted (see `vendor/`).
 * Empty charts with “no data” — range wider than the export window, or the
   export only contains business metrics. Widen to **All Time**.

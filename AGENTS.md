@@ -77,5 +77,15 @@ data/              LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history
 - **JS stays display-only:** SQL builders + rendering; no math beyond
   bucket/summary reshaping. No npm/CDN changes without noting the
   zero-build + CSP posture.
+  - **Vendored frontend deps (offline posture, 2026-09).** `vendor/`
+    self-hosts DuckDB-Wasm (MVP-only: no COOP/COEP headers are sent, so
+    `selectBundle` picks MVP anyway), Arrow ESM, ECharts, and Lucide
+    (note: the previous `lucide-static` CDN path never existed — 404).
+    `npm run build` copies `vendor/` to `dist/vendor/` (never inlined)
+    and fails on any remotely-*loaded* URL. CSP posture unchanged (no CSP
+    headers; same-origin scripts need none). Still zero-build: plain static
+    files, no bundler, no new npm dependencies. Re-vendor procedure: pinned
+    URLs + sizes are recorded in the vendor commit; `eh`/`coi` WASM builds
+    were deliberately omitted (~38 MiB).
 - Errors: scrape failures are counted (`collector_scrape_total{status}`),
   never fatal; storage init failure IS fatal (fail fast).

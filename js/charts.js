@@ -1,5 +1,5 @@
 //! ECharts wrappers: dark-theme time-series + error charts with graceful
-//! empty/loading states. Expects `window.echarts` from the CDN script tag.
+//! empty/loading states. Expects `window.echarts` from the vendor script tag.
 //! uPlot can replace these renderers later without touching callers.
 
 const AXIS = '#8b93a7';
@@ -55,7 +55,7 @@ function available() {
 
 function getChart(el) {
   if (!available()) {
-    el.innerHTML = '<div class="chart-fallback">chart library (CDN) failed to load</div>';
+    el.innerHTML = '<div class="chart-fallback">chart library failed to load</div>';
     return null;
   }
   const existing = window.echarts.getInstanceByDom(el);
