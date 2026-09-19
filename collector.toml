@@ -36,6 +36,14 @@ url = "http://localhost:8000/metrics"
 # it simply stores zero visitor rows.
 allow = ["http_", "beruang_", "tonggeret_", "visitors_", "unique_"]
 
+[[targets]]
+name = "hitung"
+url = "https://hitung.rayakala.id/metrics"
+# Same defaults: beruang business series + HTTP series flow through;
+# this app emits no visitor series, so the dashboard visitor preset
+# shows its empty state for this target (expected, not an error).
+allow = ["http_", "beruang_", "tonggeret_", "visitors_", "unique_"]
+
 # [[targets]]
 # name = "example"
 # url = "http://localhost:3000/metrics"
