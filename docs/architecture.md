@@ -103,12 +103,17 @@ On Connect, the dashboard probes `<base>/api/v1/labels`:
 - **Hot mode** (probe succeeds): `js/query_client.js:20` fetches
   `query_range` JSON; `js/hot_reshape.js:23` reshapes matrix data into the
   exact row shapes the charts already consume. Works seconds after collector
-  startup, no WASM download. Approximations: steps track the scrape cadence
-  (`1h`→15s, `24h`→5m, all→10m); throughput = per-series counter diffs
-  (restarts clamp to 0); latency avg = sum/count diffs; **p99 is absent hot**
-  (no histogram math in the client); the custom visualizer plots
-  latest-per-bucket values (its agg selector applies to the cold path; the
-  SQL preview shows the request URL instead). Badge reads `via query-range`.
+  startup, no WASM download. The query window/step are derived from the
+  collector's **recent-buffer span** (`/api/v1/status` `buffer.oldest_ts`/
+  `newest_ts`): the window zooms to the covered span (clamped to the selected
+  range) and the step is `max(15s, span/240)` so counter diffs always have
+  ≥2 buckets, with a step-widening retry on the server's point-limit error.
+  Approximations: throughput = per-series counter diffs (restarts clamp to
+  0); latency avg = sum/count diffs; **p99 is absent hot** (no histogram math
+  in the client); the custom visualizer plots latest-per-bucket values (its
+  agg selector applies to the cold path; the SQL preview shows the request
+  URL instead). Badge reads `via query-range` (plus `· last Ns` when the
+  buffer is shorter than the range).
 - **Cold mode** (probe fails): `js/duckdb_client.js:59` resolves
   `<base>/api/files` → `/telemetry/parquet`, and `js/duckdb_worker.js:45`
   queries the files with DuckDB-Wasm (range requests first, full-fetch

@@ -10,6 +10,13 @@
 //!
 //! This module is DOM-free so it can be `node --check`ed and unit-tested.
 
+/// Scrape cadence floor for the hot-mode step (seconds): counter diffs need
+/// consecutive scrapes in *different* step buckets.
+const SCRAPE_CADENCE_SECS = 15;
+/// Target number of step buckets across the covered window. Keeps the step
+/// small enough for diffs while bounding point counts.
+const TARGET_BUCKETS = 240;
+
 function finite(v) {
   const n = typeof v === 'string' ? Number(v) : v;
   return Number.isFinite(n) ? n : null;
@@ -21,22 +28,44 @@ function labelOf(metric, key, fallback) {
 }
 
 export const HotReshape = {
-  /// query_range step per UI range key. Steps track the scrape cadence
-  /// (default 15s): counter diffs need consecutive scrapes in *different*
-  /// buckets, so a step near the scrape interval keeps fresh collectors
-  /// useful within ~2 scrapes instead of one step-width.
-  stepFor(range) {
-    if (range === '1h') return 15;
-    if (range === '24h') return 300;
-    return 600;
-  },
-
   /// Least-recent start offset (seconds) per UI range key. `all` is bounded
   /// by the server's 7-day range cap; the buffer clamp warning covers the rest.
   windowFor(range) {
     if (range === '1h') return 3600;
     if (range === '24h') return 86_400;
     return 7 * 86_400;
+  },
+
+  /// Hot-mode query plan for one refresh.
+  ///
+  /// The collector's recent buffer is bounded (often far shorter than the
+  /// selected range), so the step must be derived from the **covered span**
+  /// rather than the nominal range: a step coarser than the buffer collapses
+  /// every series to one bucket and counter diffs (throughput/latency) become
+  /// empty. `coverage` is `{ oldest_ts, newest_ts }` (unix seconds) from
+  /// `/api/v1/status`, or `null` when unavailable.
+  ///
+  /// The window zooms to the covered span (clamped to the selected range), so
+  /// the x-axis shows the data that actually exists.
+  plan(range, coverage, nowSecs) {
+    const rangeStart = nowSecs - this.windowFor(range);
+    const oldest = Number.isFinite(coverage?.oldest_ts) ? coverage.oldest_ts : null;
+    const newest = Number.isFinite(coverage?.newest_ts) ? coverage.newest_ts : null;
+    const end = newest ?? nowSecs;
+    const start = oldest == null ? rangeStart : Math.max(rangeStart, oldest);
+    const span = Math.max(0, end - start);
+    const step =
+      span > 0 ? Math.max(SCRAPE_CADENCE_SECS, Math.ceil(span / TARGET_BUCKETS)) : SCRAPE_CADENCE_SECS;
+    return { start, end, step, coveredSecs: span };
+  },
+
+  /// Compact duration text (`45s`, `5m`, `2h`, `3d`) for the coverage hint.
+  fmtDuration(secs) {
+    const s = Math.max(0, Math.round(Number(secs) || 0));
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.round(s / 60)}m`;
+    if (s < 86_400) return `${Math.round(s / 3600)}h`;
+    return `${Math.round(s / 86_400)}d`;
   },
 
   /// Group matrix result entries by series. Returns

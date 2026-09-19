@@ -1069,6 +1069,13 @@ const DataSource = {
 //!
 //! This module is DOM-free so it can be `node --check`ed and unit-tested.
 
+/// Scrape cadence floor for the hot-mode step (seconds): counter diffs need
+/// consecutive scrapes in *different* step buckets.
+const SCRAPE_CADENCE_SECS = 15;
+/// Target number of step buckets across the covered window. Keeps the step
+/// small enough for diffs while bounding point counts.
+const TARGET_BUCKETS = 240;
+
 function finite(v) {
   const n = typeof v === 'string' ? Number(v) : v;
   return Number.isFinite(n) ? n : null;
@@ -1080,22 +1087,44 @@ function labelOf(metric, key, fallback) {
 }
 
 const HotReshape = {
-  /// query_range step per UI range key. Steps track the scrape cadence
-  /// (default 15s): counter diffs need consecutive scrapes in *different*
-  /// buckets, so a step near the scrape interval keeps fresh collectors
-  /// useful within ~2 scrapes instead of one step-width.
-  stepFor(range) {
-    if (range === '1h') return 15;
-    if (range === '24h') return 300;
-    return 600;
-  },
-
   /// Least-recent start offset (seconds) per UI range key. `all` is bounded
   /// by the server's 7-day range cap; the buffer clamp warning covers the rest.
   windowFor(range) {
     if (range === '1h') return 3600;
     if (range === '24h') return 86_400;
     return 7 * 86_400;
+  },
+
+  /// Hot-mode query plan for one refresh.
+  ///
+  /// The collector's recent buffer is bounded (often far shorter than the
+  /// selected range), so the step must be derived from the **covered span**
+  /// rather than the nominal range: a step coarser than the buffer collapses
+  /// every series to one bucket and counter diffs (throughput/latency) become
+  /// empty. `coverage` is `{ oldest_ts, newest_ts }` (unix seconds) from
+  /// `/api/v1/status`, or `null` when unavailable.
+  ///
+  /// The window zooms to the covered span (clamped to the selected range), so
+  /// the x-axis shows the data that actually exists.
+  plan(range, coverage, nowSecs) {
+    const rangeStart = nowSecs - this.windowFor(range);
+    const oldest = Number.isFinite(coverage?.oldest_ts) ? coverage.oldest_ts : null;
+    const newest = Number.isFinite(coverage?.newest_ts) ? coverage.newest_ts : null;
+    const end = newest ?? nowSecs;
+    const start = oldest == null ? rangeStart : Math.max(rangeStart, oldest);
+    const span = Math.max(0, end - start);
+    const step =
+      span > 0 ? Math.max(SCRAPE_CADENCE_SECS, Math.ceil(span / TARGET_BUCKETS)) : SCRAPE_CADENCE_SECS;
+    return { start, end, step, coveredSecs: span };
+  },
+
+  /// Compact duration text (`45s`, `5m`, `2h`, `3d`) for the coverage hint.
+  fmtDuration(secs) {
+    const s = Math.max(0, Math.round(Number(secs) || 0));
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.round(s / 60)}m`;
+    if (s < 86_400) return `${Math.round(s / 3600)}h`;
+    return `${Math.round(s / 86_400)}d`;
   },
 
   /// Group matrix result entries by series. Returns
@@ -1285,6 +1314,16 @@ function emitStatus(onStatus, phase, detail) {
   }
 }
 
+/// Point count from the collector's over-limit error
+/// (`"query would return N points (limit 10000); increase step"`), or `null`.
+function parsePointLimit(message) {
+  const m = /(\d+)\s+points/.exec(String(message ?? ''));
+  return m ? Number(m[1]) : null;
+}
+
+/// Server-side point cap (`src/query.rs::MAX_POINTS`).
+const MAX_POINTS = 10_000;
+
 const HotClient = {
   baseUrl: '',
   mode: 'query-range',
@@ -1304,19 +1343,54 @@ const HotClient = {
     }
   },
 
-  async rangeQuery(selector, range, onStatus, label) {
-    const step = HotReshape.stepFor(range);
-    const end = Date.now() / 1000;
-    const start = end - HotReshape.windowFor(range);
-    const url =
-      `${this.baseUrl}/api/v1/query_range?query=${encodeURIComponent(selector)}` +
-      `&start=${start}&end=${end}&step=${step}`;
+  /// Recent-buffer coverage (`{oldest_ts, newest_ts}` unix seconds) from
+  /// `/api/v1/status`, or `null` when unavailable/empty. Sizes the hot
+  /// window and step so counter diffs survive (see `HotReshape.plan`).
+  async coverage() {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/v1/status`);
+      if (!res.ok) return null;
+      const body = await res.json();
+      const oldest = body?.buffer?.oldest_ts;
+      const newest = body?.buffer?.newest_ts;
+      if (!Number.isFinite(oldest) || !Number.isFinite(newest)) return null;
+      return { oldest_ts: Number(oldest), newest_ts: Number(newest) };
+    } catch {
+      return null;
+    }
+  },
+
+  /// Mode badge text: append the covered window when it is shorter than the
+  /// selected range (hot mode only holds the recent buffer).
+  coverageLabel(coveredSecs, range) {
+    const full = HotReshape.windowFor(range);
+    if (!Number.isFinite(coveredSecs) || coveredSecs <= 0 || coveredSecs >= full) {
+      return this.mode;
+    }
+    return `${this.mode} · last ${HotReshape.fmtDuration(coveredSecs)}`;
+  },
+
+  /// Run one range query under `plan` (`{start,end,step}`). On the server's
+  /// point-limit 400, widen `plan.step` (shared object, so later queries see
+  /// it) and retry.
+  async rangeQuery(selector, plan, onStatus, label) {
     emitStatus(onStatus, 'querying', label ?? `querying ${selector}…`);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-    const body = await res.json();
-    if (body?.status !== 'success') throw new Error(body?.error ?? 'query failed');
-    return { url, result: body?.data?.result ?? [] };
+    for (let attempt = 0; ; attempt++) {
+      const url =
+        `${this.baseUrl}/api/v1/query_range?query=${encodeURIComponent(selector)}` +
+        `&start=${plan.start}&end=${plan.end}&step=${plan.step}`;
+      const res = await fetch(url);
+      const body = await res.json().catch(() => null);
+      if (res.ok && body?.status === 'success') {
+        return { url, result: body?.data?.result ?? [] };
+      }
+      const points = parsePointLimit(body?.error);
+      if (res.status === 400 && points && attempt < 2) {
+        plan.step = Math.max(plan.step + 1, Math.ceil((plan.step * points * 1.05) / MAX_POINTS));
+        continue;
+      }
+      throw new Error(body?.error ?? body?.detail ?? `HTTP ${res.status} for ${url}`);
+    }
   },
 
   selector(metric, labelKey, labelValue, target = '') {
@@ -1352,22 +1426,26 @@ const HotClient = {
 
   async refreshAll(range, target, onStatus) {
     const target0 = String(target ?? '').trim();
-    const [total, sum, count, names, visTotal, visUniques] = await Promise.all([
-      this.rangeQuery(
-        this.targetSelector('http_requests_total', target0),
-        range,
-        onStatus,
-        'aggregating throughput…',
-      ),
+    const coverage = await this.coverage();
+    const plan = HotReshape.plan(range, coverage, Date.now() / 1000);
+    // Throughput first: its query may widen `plan.step` on the point-limit
+    // error, and the shared plan object then applies to the rest.
+    const total = await this.rangeQuery(
+      this.targetSelector('http_requests_total', target0),
+      plan,
+      onStatus,
+      'aggregating throughput…',
+    );
+    const [sum, count, names, visTotal, visUniques] = await Promise.all([
       this.rangeQuery(
         this.targetSelector('http_request_duration_ms_sum', target0),
-        range,
+        plan,
         onStatus,
         'aggregating latency…',
       ),
       this.rangeQuery(
         this.targetSelector('http_request_duration_ms_count', target0),
-        range,
+        plan,
         onStatus,
         'aggregating latency…',
       ),
@@ -1379,13 +1457,13 @@ const HotClient = {
       })().catch(() => []),
       this.rangeQuery(
         this.targetSelector('visitors_total', target0),
-        range,
+        plan,
         onStatus,
         'aggregating visitors…',
       ).catch(() => ({ result: [] })),
       this.rangeQuery(
         this.targetSelector('unique_visitors_estimate', target0),
-        range,
+        plan,
         onStatus,
         'aggregating visitors…',
       ).catch(() => ({ result: [] })),
@@ -1401,21 +1479,23 @@ const HotClient = {
       HotReshape.groupBySeries(visTotal.result),
       HotReshape.groupBySeries(visUniques.result),
     );
-    const bucketSecs = { '1h': 15, '24h': 300, all: 600 }[range] ?? 300;
     emitStatus(onStatus, 'idle', `${throughput.length} bucket(s) via query_range`);
     return {
       throughput,
       errors,
       names,
       visitors,
-      summary: HotReshape.summarize(throughput, errors, bucketSecs),
+      coveredSecs: plan.coveredSecs,
+      summary: HotReshape.summarize(throughput, errors, plan.step),
     };
   },
 
   async runCustom(opts, onStatus) {
+    const coverage = await this.coverage();
+    const plan = HotReshape.plan(opts.range, coverage, Date.now() / 1000);
     const { url, result } = await this.rangeQuery(
       this.selector(opts.metric, opts.labelKey ?? '', opts.labelValue ?? '', opts.target ?? ''),
-      opts.range,
+      plan,
       onStatus,
       `plotting ${opts.metric}…`,
     );
@@ -2534,7 +2614,8 @@ async function refresh({ reconnect }) {
     const data = useHot
       ? await HotClient.refreshAll(range, target, setStatusCb)
       : await DataSource.refreshAll(range, target, setStatusCb);
-    Cards.render(data.summary, useHot ? HotClient.mode : DataSource.mode);
+    const mode = useHot ? HotClient.coverageLabel(data.coveredSecs, range) : DataSource.mode;
+    Cards.render(data.summary, mode);
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);

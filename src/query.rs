@@ -73,6 +73,18 @@ impl RecentBuffer {
         (self.inner.lock().map_or(0, |q| q.len()), self.cap)
     }
 
+    /// Oldest and newest buffered sample timestamps (`ts_micros`), or `None`
+    /// when empty. The dashboard uses this to size its hot-mode query window
+    /// and step so counter diffs survive (see `hot_reshape.plan`).
+    #[must_use]
+    pub fn span(&self) -> Option<(u64, u64)> {
+        let q = self.inner.lock().ok()?;
+        match (q.front(), q.back()) {
+            (Some(oldest), Some(newest)) => Some((oldest.ts_micros, newest.ts_micros)),
+            _ => None,
+        }
+    }
+
     /// Append samples from one scrape of `target`; evict oldest past capacity.
     /// Evictions are counted, never fatal.
     pub fn push_batch(&self, target: &str, samples: &[BufferedSample]) {
@@ -632,6 +644,22 @@ mod tests {
             .unwrap();
         let vals: Vec<f64> = out.series[0].buckets.values().map(|(_, v)| *v).collect();
         assert_eq!(vals, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn span_reports_oldest_and_newest() {
+        let b = RecentBuffer::new(100);
+        assert_eq!(b.span(), None);
+        b.push_batch(
+            "app",
+            &[sample(1_000, "m", 1.0, &[]), sample(3_000, "m", 3.0, &[])],
+        );
+        assert_eq!(b.span(), Some((1_000, 3_000)));
+
+        // Oldest eviction moves the span's start forward.
+        let b = RecentBuffer::new(1);
+        b.push_batch("app", &[sample(1, "m", 1.0, &[]), sample(2, "m", 2.0, &[])]);
+        assert_eq!(b.span(), Some((2, 2)));
     }
 
     #[test]

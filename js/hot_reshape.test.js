@@ -10,13 +10,51 @@ function matrix(entries) {
   return entries.map(([metric, values]) => ({ metric, values }));
 }
 
-describe('stepFor/windowFor', () => {
-  it('maps UI ranges to steps and windows', () => {
-    assert.equal(HotReshape.stepFor('1h'), 15);
-    assert.equal(HotReshape.stepFor('24h'), 300);
-    assert.equal(HotReshape.stepFor('all'), 600);
+describe('windowFor', () => {
+  it('maps UI ranges to windows', () => {
     assert.equal(HotReshape.windowFor('1h'), 3600);
+    assert.equal(HotReshape.windowFor('24h'), 86_400);
     assert.equal(HotReshape.windowFor('all'), 7 * 86_400);
+  });
+});
+
+describe('plan', () => {
+  const now = 1_000_000;
+
+  it('falls back to the nominal range when coverage is unknown', () => {
+    const p = HotReshape.plan('24h', null, now);
+    assert.equal(p.start, now - 86_400);
+    assert.equal(p.end, now);
+    assert.equal(p.step, 360); // ceil(86400 / 240)
+    assert.equal(p.coveredSecs, 86_400);
+  });
+
+  it('zooms to the covered span and keeps cadence buckets when the buffer is short', () => {
+    // 45s buffer, user asked 24h: every series must land in >=2 buckets so
+    // counter diffs survive.
+    const p = HotReshape.plan('24h', { oldest_ts: now - 45, newest_ts: now }, now);
+    assert.equal(p.start, now - 45);
+    assert.equal(p.end, now);
+    assert.equal(p.step, 15);
+    assert.equal(p.coveredSecs, 45);
+    assert.ok(Math.floor(p.coveredSecs / p.step) >= 2);
+  });
+
+  it('keeps the selected range when the buffer covers it', () => {
+    const p = HotReshape.plan('1h', { oldest_ts: now - 7200, newest_ts: now }, now);
+    assert.equal(p.start, now - 3600);
+    assert.equal(p.end, now);
+    assert.equal(p.step, 15);
+  });
+});
+
+describe('fmtDuration', () => {
+  it('renders compact units', () => {
+    assert.equal(HotReshape.fmtDuration(45), '45s');
+    assert.equal(HotReshape.fmtDuration(300), '5m');
+    assert.equal(HotReshape.fmtDuration(7200), '2h');
+    assert.equal(HotReshape.fmtDuration(172800), '2d');
+    assert.equal(HotReshape.fmtDuration(0), '0s');
   });
 });
 
