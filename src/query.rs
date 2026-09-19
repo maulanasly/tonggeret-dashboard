@@ -97,6 +97,17 @@ impl RecentBuffer {
         }
     }
 
+    /// Sorted distinct metric names currently buffered (backs `/api/v1/labels`
+    /// so hot-mode clients can offer a metric picker without a query language).
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        if let Ok(q) = self.inner.lock() {
+            set.extend(q.iter().map(|s| s.name.clone()));
+        }
+        set.into_iter().collect()
+    }
+
     /// Run a parsed range query: filter → group by series → latest per
     /// step-bucket. Returns series in first-seen order plus whether the
     /// requested start predates the buffer (partial answer).
@@ -631,6 +642,13 @@ mod tests {
         assert_eq!(format_value(f64::NAN), "NaN");
         assert_eq!(format_value(f64::INFINITY), "+Inf");
         assert_eq!(format_value(f64::NEG_INFINITY), "-Inf");
+    }
+
+    #[test]
+    fn names_lists_distinct_sorted_series() {
+        let b = seeded();
+        assert_eq!(b.names(), vec!["http_x".to_string(), "other".to_string()]);
+        assert!(RecentBuffer::new(10).names().is_empty());
     }
 
     #[test]

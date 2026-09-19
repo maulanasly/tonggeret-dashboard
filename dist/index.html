@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>duckmetrics-dashboard — client-side telemetry</title>
+  <title>tonggeret-dashboard — client-side telemetry</title>
   <meta
     name="description"
-    content="Zero-server-query dashboard for duckmetrics Fjall/Parquet exports. DuckDB-Wasm in your browser queries remote Parquet over HTTP."
+    content="Zero-server-query dashboard for tonggeret Fjall/Parquet exports. DuckDB-Wasm in your browser queries remote Parquet over HTTP."
   />
   <style>
 :root {
@@ -213,14 +213,14 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   </script>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/lucide-static@0.469.0/dist/umd/lucide.min.js" defer></script>
-<!-- bundled: npm run build (duckmetrics-dashboard) -->
+<!-- bundled: npm run build (tonggeret-dashboard) -->
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <i data-lucide="activity" class="brand-icon"></i>
       <div>
-        <h1>duckmetrics-dashboard</h1>
+        <h1>tonggeret-dashboard</h1>
         <p class="subtitle">browser-side analytics over <code>/telemetry/parquet</code></p>
       </div>
     </div>
@@ -347,9 +347,9 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 import * as duckdb from '@duckdb/duckdb-wasm';
 
 /* ---- js/queries.js ---- */
-//! Analytical SQL builders for the duckmetrics Parquet consumption contract.
+//! Analytical SQL builders for the tonggeret Parquet consumption contract.
 //!
-//! Cold export schema (see duckmetrics `parquet_exporter.rs`):
+//! Cold export schema (see tonggeret `parquet_exporter.rs`):
 //! `ts Timestamp(Microsecond)`, `name Utf8`, `value Float64`,
 //! `metric_type Utf8`, `labels Utf8` (JSON object string).
 //!
@@ -692,7 +692,7 @@ const DataSource = {
   /// Resolve free-form user input to Parquet file URL(s).
   /// - `…/x.parquet` → that file directly.
   /// - otherwise → `<base>/api/files` manifest if present,
-  ///   else `<base>/telemetry/parquet` (duckmetrics file route).
+  ///   else `<base>/telemetry/parquet` (tonggeret file route).
   async resolveInput(input) {
     const trimmed = input.trim().replace(/\/$/, '');
     if (trimmed === '') throw new Error('empty data source URL');
@@ -762,6 +762,330 @@ const DataSource = {
       errorRate: total > 0 ? errCount / total : 0,
       errorCount: errCount,
     };
+  },
+};
+
+
+/* ---- js/hot_reshape.js ---- */
+//! Hot-mode reshaping: Prometheus `query_range` matrix JSON → the exact row
+//! shapes the charts/cards/controls modules already consume.
+//!
+//! Display-only reshaping, same contract as the DuckDB builders:
+//! * counters are cumulative snapshots → per-bucket counts come from
+//!   consecutive-sample diffs (negative diffs from restarts clamp to 0);
+//! * gauge estimates are never summed — latest per (series, bucket);
+//! * latency `avg` comes from sum/count diffs; `p99` is unavailable hot
+//!   (histogram math stays out of the client) and renders as absent.
+//!
+//! This module is DOM-free so it can be `node --check`ed and unit-tested.
+
+function finite(v) {
+  const n = typeof v === 'string' ? Number(v) : v;
+  return Number.isFinite(n) ? n : null;
+}
+
+function labelOf(metric, key, fallback) {
+  const v = metric[key];
+  return v === undefined || v === null || v === '' ? fallback : String(v);
+}
+
+const HotReshape = {
+  /// query_range step per UI range key. Steps track the scrape cadence
+  /// (default 15s): counter diffs need consecutive scrapes in *different*
+  /// buckets, so a step near the scrape interval keeps fresh collectors
+  /// useful within ~2 scrapes instead of one step-width.
+  stepFor(range) {
+    if (range === '1h') return 15;
+    if (range === '24h') return 300;
+    return 600;
+  },
+
+  /// Least-recent start offset (seconds) per UI range key. `all` is bounded
+  /// by the server's 7-day range cap; the buffer clamp warning covers the rest.
+  windowFor(range) {
+    if (range === '1h') return 3600;
+    if (range === '24h') return 86_400;
+    return 7 * 86_400;
+  },
+
+  /// Group matrix result entries by series. Returns
+  /// `[{ name, labels, points: [{ t, v }] }]` with `t` in seconds, `v` a
+  /// finite number or null, points sorted by time.
+  groupBySeries(result) {
+    const groups = new Map();
+    for (const entry of result ?? []) {
+      const metric = entry.metric ?? {};
+      const name = String(metric.__name__ ?? '(unknown)');
+      const labels = Object.entries(metric)
+        .filter(([k]) => k !== '__name__')
+        .map(([k, v]) => [String(k), String(v)])
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      const key = `${name}\n${labels.map(([k, v]) => `${k}=${v}`).join('\n')}`;
+      if (!groups.has(key)) groups.set(key, { name, labels, points: [] });
+      for (const [t, vs] of entry.values ?? []) {
+        groups.get(key).points.push({ t: Number(t), v: finite(vs) });
+      }
+    }
+    for (const g of groups.values()) g.points.sort((a, b) => a.t - b.t);
+    return [...groups.values()];
+  },
+
+  /// Per-series consecutive diffs, negative (restart) clamped to 0.
+  /// Returns `[{ t, d }]` attributed to the later sample's bucket.
+  diffs(points) {
+    const out = [];
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1].v;
+      const b = points[i].v;
+      if (a == null || b == null) continue;
+      out.push({ t: points[i].t, d: Math.max(0, b - a) });
+    }
+    return out;
+  },
+
+  /// Throughput + latency rows from counter groups. `sumGroups`/`countGroups`
+  /// are the `_sum`/`_count` companions of the same histogram family.
+  /// Row shape matches the DuckDB path: `{ bucket_us, reqs, avg_ms, p99_ms }`
+  /// with `p99_ms` always null (unavailable without histogram math).
+  throughputFromGroups(totalGroups, sumGroups, countGroups) {
+    const buckets = new Map();
+    const add = (groups, field) => {
+      for (const g of groups) {
+        for (const { t, d } of this.diffs(g.points)) {
+          if (!buckets.has(t)) buckets.set(t, { reqs: 0, sum: 0, count: 0 });
+          buckets.get(t)[field] += d;
+        }
+      }
+    };
+    add(totalGroups, 'reqs');
+    add(sumGroups, 'sum');
+    add(countGroups, 'count');
+    return [...buckets.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([t, b]) => ({
+        bucket_us: Math.floor(t * 1_000_000),
+        reqs: b.reqs,
+        avg_ms: b.count > 0 ? b.sum / b.count : null,
+        p99_ms: null,
+      }));
+  },
+
+  /// Error distribution from `http_requests_total` groups. Totals are range
+  /// deltas (last − first per series, clamped), matching the DuckDB
+  /// `count(*)`-in-range semantics. Only paths with errors are listed.
+  errorsFromGroups(totalGroups) {
+    const byPath = new Map();
+    for (const g of totalGroups) {
+      const labels = Object.fromEntries(g.labels);
+      const path = labelOf(labels, 'path', '(unknown)');
+      const status = labelOf(labels, 'status', '');
+      const vals = g.points.map((p) => p.v).filter((v) => v != null);
+      if (vals.length === 0) continue;
+      const delta = Math.max(0, vals[vals.length - 1] - vals[0]);
+      if (!byPath.has(path)) byPath.set(path, { c4xx: 0, c5xx: 0, total: 0 });
+      const row = byPath.get(path);
+      row.total += delta;
+      if (status.startsWith('4')) row.c4xx += delta;
+      else if (status.startsWith('5')) row.c5xx += delta;
+    }
+    return [...byPath.entries()]
+      .filter(([, r]) => r.c4xx + r.c5xx > 0)
+      .sort(([, a], [, b]) => b.c4xx + b.c5xx - (a.c4xx + a.c5xx))
+      .slice(0, 20)
+      .map(([path, r]) => ({ path, ...r }));
+  },
+
+  /// Visitor rows from the two visitor counter/gauge groups. Row shape
+  /// matches the DuckDB preset: `{ bucket_us, target, region, visitors, uniques }`.
+  visitorsFromGroups(totalGroups, uniquesGroups) {
+    const cells = new Map();
+    const put = (groups, field) => {
+      for (const g of groups) {
+        const labels = Object.fromEntries(g.labels);
+        const key = `${labelOf(labels, 'scrape_target', '(unknown)')}\n${labelOf(labels, 'region', '(unknown)')}`;
+        for (const p of g.points) {
+          if (p.v == null) continue;
+          const cell = `${Math.floor(p.t)}\n${key}`;
+          if (!cells.has(cell)) {
+            const [target, region] = key.split('\n');
+            cells.set(cell, {
+              bucket_us: Math.floor(p.t * 1_000_000),
+              target,
+              region,
+              visitors: null,
+              uniques: null,
+            });
+          }
+          cells.get(cell)[field] = p.v;
+        }
+      }
+    };
+    put(totalGroups, 'visitors');
+    put(uniquesGroups, 'uniques');
+    return [...cells.values()].sort((a, b) => a.bucket_us - b.bucket_us);
+  },
+
+  /// Custom visualizer rows: per-bucket mean of contributing series.
+  customFromGroups(groups) {
+    const buckets = new Map();
+    for (const g of groups) {
+      for (const p of g.points) {
+        if (p.v == null) continue;
+        if (!buckets.has(p.t)) buckets.set(p.t, []);
+        buckets.get(p.t).push(p.v);
+      }
+    }
+    return [...buckets.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([t, vs]) => ({
+        bucket_us: Math.floor(t * 1_000_000),
+        v: vs.reduce((a, b) => a + b, 0) / vs.length,
+        n: vs.length,
+      }));
+  },
+
+  namesFromLabels(data) {
+    return Array.isArray(data) ? data.map(String) : [];
+  },
+
+  /// Summary numbers from throughput + error rows (same derivation as the
+  /// DuckDB path's `summarize`, kept local so this module stays dependency-free).
+  summarize(throughput, errors, bucketSecs) {
+    let total = 0;
+    let latSum = 0;
+    let latN = 0;
+    let peak = 0;
+    for (const r of throughput) {
+      total += r.reqs;
+      if (r.reqs > peak) peak = r.reqs;
+      if (r.avg_ms != null && Number.isFinite(r.avg_ms)) {
+        latSum += r.avg_ms * r.reqs;
+        latN += r.reqs;
+      }
+    }
+    let errCount = 0;
+    for (const e of errors) errCount += e.c4xx + e.c5xx;
+    return {
+      total,
+      avgMs: latN > 0 ? latSum / latN : null,
+      peakPerSec: bucketSecs > 0 ? peak / bucketSecs : peak,
+      errorRate: total > 0 ? errCount / total : 0,
+      errorCount: errCount,
+    };
+  },
+};
+
+
+/* ---- js/query_client.js ---- */
+//! Hot-mode data source: query_range JSON from the collector instead of
+//! Parquet-via-DuckDB. Return shapes mirror `duckdb_client.js` exactly
+//! (`throughput`, `errors`, `names`, `visitors`, `summary`) so callers
+//! render unchanged; only the transport + reshaping differ.
+//!
+//! `summarize` is intentionally duplicated from `duckdb_client.js` (kept
+//! local so this module imports nothing but the DOM-free reshaper —
+//! `duckdb_client.js` pulls the CDN WASM import, which Node cannot load).
+
+
+function emit(onStatus, phase, detail) {
+  try {
+    onStatus?.({ phase, detail: detail ?? '', at: Date.now() });
+  } catch {
+    // Status subscribers must never break queries.
+  }
+}
+
+const HotClient = {
+  baseUrl: '',
+  mode: 'query-range',
+
+  /// Capability probe: cheap, param-less, no time math. False on any
+  /// failure (non-2xx, non-JSON, CORS) — the caller falls back to Parquet.
+  async probe(input) {
+    const base = input.trim().replace(/\/$/, '');
+    if (base === '') return false;
+    try {
+      const res = await fetch(`${base}/api/v1/labels`);
+      if (!res.ok) return false;
+      const body = await res.json();
+      return body?.status === 'success' && Array.isArray(body?.data);
+    } catch {
+      return false;
+    }
+  },
+
+  async rangeQuery(selector, range, onStatus, label) {
+    const step = HotReshape.stepFor(range);
+    const end = Date.now() / 1000;
+    const start = end - HotReshape.windowFor(range);
+    const url =
+      `${this.baseUrl}/api/v1/query_range?query=${encodeURIComponent(selector)}` +
+      `&start=${start}&end=${end}&step=${step}`;
+    emit(onStatus, 'querying', label ?? `querying ${selector}…`);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    const body = await res.json();
+    if (body?.status !== 'success') throw new Error(body?.error ?? 'query failed');
+    return { url, result: body?.data?.result ?? [] };
+  },
+
+  selector(metric, labelKey, labelValue) {
+    if (labelKey.trim() === '') return metric;
+    if (labelValue.trim() === '') return metric;
+    const q = (v) => `"${String(v).replaceAll('"', '')}"`;
+    return `{__name__=${q(metric)},${labelKey.trim()}=${q(labelValue.trim())}}`;
+  },
+
+  async refreshAll(range, onStatus) {
+    const [total, sum, count, names, visTotal, visUniques] = await Promise.all([
+      this.rangeQuery('http_requests_total', range, onStatus, 'aggregating throughput…'),
+      this.rangeQuery('http_request_duration_ms_sum', range, onStatus, 'aggregating latency…'),
+      this.rangeQuery('http_request_duration_ms_count', range, onStatus, 'aggregating latency…'),
+      (async () => {
+        const res = await fetch(`${this.baseUrl}/api/v1/labels`);
+        if (!res.ok) return [];
+        const body = await res.json();
+        return HotReshape.namesFromLabels(body?.data);
+      })().catch(() => []),
+      this.rangeQuery('visitors_total', range, onStatus, 'aggregating visitors…').catch(() => ({ result: [] })),
+      this.rangeQuery('unique_visitors_estimate', range, onStatus, 'aggregating visitors…').catch(
+        () => ({ result: [] }),
+      ),
+    ]);
+    const totalGroups = HotReshape.groupBySeries(total.result);
+    const throughput = HotReshape.throughputFromGroups(
+      totalGroups,
+      HotReshape.groupBySeries(sum.result),
+      HotReshape.groupBySeries(count.result),
+    );
+    const errors = HotReshape.errorsFromGroups(totalGroups);
+    const visitors = HotReshape.visitorsFromGroups(
+      HotReshape.groupBySeries(visTotal.result),
+      HotReshape.groupBySeries(visUniques.result),
+    );
+    const bucketSecs = { '1h': 15, '24h': 300, all: 600 }[range] ?? 300;
+    emit(onStatus, 'idle', `${throughput.length} bucket(s) via query_range`);
+    return {
+      throughput,
+      errors,
+      names,
+      visitors,
+      summary: HotReshape.summarize(throughput, errors, bucketSecs),
+    };
+  },
+
+  async runCustom(opts, onStatus) {
+    const { url, result } = await this.rangeQuery(
+      this.selector(opts.metric, opts.labelKey ?? '', opts.labelValue ?? ''),
+      opts.range,
+      onStatus,
+      `plotting ${opts.metric}…`,
+    );
+    // Hot mode plots latest-per-bucket values; the agg selector applies to
+    // the Parquet path only (noted in the SQL preview as the request URL).
+    const rows = HotReshape.customFromGroups(HotReshape.groupBySeries(result));
+    emit(onStatus, 'idle', `${rows.length} bucket(s) via query_range`);
+    return { url, rows };
   },
 };
 
@@ -1196,6 +1520,9 @@ function corsHint(url) {
 
 let connectedUrl = '';
 let refreshing = false;
+// True when the source speaks /api/v1/query_range (probed per connect);
+// otherwise the DuckDB-Wasm Parquet path is used.
+let useHot = false;
 
 async function refresh({ reconnect }) {
   if (refreshing) return;
@@ -1206,16 +1533,26 @@ async function refresh({ reconnect }) {
     const range = Controls.getRange();
     if (reconnect || connectedUrl !== source) {
       setStatus('metadata-loading', `connecting to ${source}…`);
-      await DataSource.connect(source, setStatusCb);
+      useHot = await HotClient.probe(source).catch(() => false);
+      if (useHot) {
+        HotClient.baseUrl = source.trim().replace(/\/$/, '');
+        setStatus('idle', 'hot query API available');
+      } else {
+        await DataSource.connect(source, setStatusCb);
+      }
       connectedUrl = source;
     }
-    const data = await DataSource.refreshAll(range, setStatusCb);
-    Cards.render(data.summary, DataSource.mode);
+    const data = useHot
+      ? await HotClient.refreshAll(range, setStatusCb)
+      : await DataSource.refreshAll(range, setStatusCb);
+    Cards.render(data.summary, useHot ? HotClient.mode : DataSource.mode);
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);
+    // Present once the visitor-preset branch lands (no-op until then).
+    Charts.renderVisitors?.(data.visitors ?? []);
     Controls.setNames(data.names);
-    Controls.setSql(Queries.throughputLatency(range));
+    Controls.setSql(useHot ? `hot: ${HotClient.baseUrl} (query_range)` : Queries.throughputLatency(range));
   } catch (err) {
     const msg = err?.message ?? String(err);
     const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);
@@ -1229,6 +1566,13 @@ async function refresh({ reconnect }) {
 async function runCustom() {
   showError('');
   try {
+    if (useHot) {
+      const opts = Controls.getCustom();
+      const { url, rows } = await HotClient.runCustom(opts, setStatusCb);
+      Charts.renderCustom(rows, opts.metric, opts.agg);
+      Controls.setSql(`hot query (agg applies to the Parquet path only):\n${url}`);
+      return;
+    }
     const opts = Controls.getCustom();
     const { sql, rows } = await DataSource.runCustom(opts, setStatusCb);
     Charts.renderCustom(rows, opts.metric, opts.agg);

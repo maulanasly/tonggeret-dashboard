@@ -3,6 +3,7 @@
 //! only orchestrates state and rendering on the main thread.
 
 import { DataSource } from './duckdb_client.js';
+import { HotClient } from './query_client.js';
 import { Queries } from './queries.js';
 import { WorkerEngine } from './duckdb_worker.js';
 import { Charts } from './charts.js';
@@ -49,6 +50,9 @@ function corsHint(url) {
 
 let connectedUrl = '';
 let refreshing = false;
+// True when the source speaks /api/v1/query_range (probed per connect);
+// otherwise the DuckDB-Wasm Parquet path is used.
+let useHot = false;
 
 async function refresh({ reconnect }) {
   if (refreshing) return;
@@ -59,16 +63,26 @@ async function refresh({ reconnect }) {
     const range = Controls.getRange();
     if (reconnect || connectedUrl !== source) {
       setStatus('metadata-loading', `connecting to ${source}…`);
-      await DataSource.connect(source, setStatusCb);
+      useHot = await HotClient.probe(source).catch(() => false);
+      if (useHot) {
+        HotClient.baseUrl = source.trim().replace(/\/$/, '');
+        setStatus('idle', 'hot query API available');
+      } else {
+        await DataSource.connect(source, setStatusCb);
+      }
       connectedUrl = source;
     }
-    const data = await DataSource.refreshAll(range, setStatusCb);
-    Cards.render(data.summary, DataSource.mode);
+    const data = useHot
+      ? await HotClient.refreshAll(range, setStatusCb)
+      : await DataSource.refreshAll(range, setStatusCb);
+    Cards.render(data.summary, useHot ? HotClient.mode : DataSource.mode);
     Charts.renderThroughput(data.throughput);
     Charts.renderLatency(data.throughput);
     Charts.renderErrors(data.errors);
+    // Present once the visitor-preset branch lands (no-op until then).
+    Charts.renderVisitors?.(data.visitors ?? []);
     Controls.setNames(data.names);
-    Controls.setSql(Queries.throughputLatency(range));
+    Controls.setSql(useHot ? `hot: ${HotClient.baseUrl} (query_range)` : Queries.throughputLatency(range));
   } catch (err) {
     const msg = err?.message ?? String(err);
     const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);
@@ -82,6 +96,13 @@ async function refresh({ reconnect }) {
 async function runCustom() {
   showError('');
   try {
+    if (useHot) {
+      const opts = Controls.getCustom();
+      const { url, rows } = await HotClient.runCustom(opts, setStatusCb);
+      Charts.renderCustom(rows, opts.metric, opts.agg);
+      Controls.setSql(`hot query (agg applies to the Parquet path only):\n${url}`);
+      return;
+    }
     const opts = Controls.getCustom();
     const { sql, rows } = await DataSource.runCustom(opts, setStatusCb);
     Charts.renderCustom(rows, opts.metric, opts.agg);
