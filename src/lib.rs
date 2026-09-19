@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod query;
+pub mod queue;
 pub mod scrape;
 pub mod serve;
 pub mod status;
+pub mod targets;

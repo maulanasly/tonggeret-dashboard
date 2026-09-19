@@ -90,6 +90,61 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .btn:hover { border-color: var(--accent); }
 .btn.primary { background: #0c4a6e; border-color: #0369a1; }
 .btn.primary:hover { background: #075985; }
+.btn.tiny { padding: 2px 8px; font-size: 0.72rem; }
+.btn.danger { color: var(--bad); border-color: #7f1d1d; }
+.btn.danger:hover { border-color: var(--bad); }
+
+.targets-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+.targets-form label { display: grid; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+.targets-form label.grow { flex: 1 1 260px; }
+.targets-form textarea, .targets-form input, .targets-form select {
+  background: #020617;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 0.82rem;
+}
+.targets-error {
+  margin-top: 8px;
+  color: var(--bad);
+  border: 1px solid #7f1d1d;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}
+.queue-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.subhead { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 14px 0 4px; }
+.target-list, .queue-list { display: grid; gap: 2px; font-size: 0.82rem; }
+.target-row {
+  display: grid;
+  grid-template-columns: minmax(70px, auto) minmax(120px, auto) 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+}
+.target-row:first-child { border-top: none; }
+.target-name { font-weight: 600; }
+.target-meta { color: var(--muted); font-size: 0.74rem; }
+.target-url { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-actions { display: flex; gap: 4px; justify-content: flex-end; }
+.queue-summary { color: var(--muted); font-size: 0.78rem; margin-bottom: 2px; }
+.queue-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+}
+.queue-state { font-size: 0.72rem; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+.queue-state[data-state="done"] { color: var(--good); border-color: var(--good); }
+.queue-state[data-state="failed"] { color: var(--bad); border-color: var(--bad); }
+.queue-row.running .queue-state { color: var(--warn); border-color: var(--warn); }
+.queue-meta { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 
 .status { display: flex; gap: 8px; align-items: center; font-size: 0.8rem; color: var(--muted); max-width: 320px; }
 #statusText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -77,6 +77,59 @@
       </div>
     </section>
 
+    <section class="panel targets-panel" aria-label="targets and queue">
+      <header>
+        <h2><i data-lucide="list-plus"></i>Targets &amp; queue</h2>
+        <span id="queueBadge" class="badge" data-status="offline">queue idle</span>
+      </header>
+      <div class="targets-form">
+        <label class="grow">URLs (one per line)
+          <textarea
+            id="targetUrls"
+            rows="3"
+            spellcheck="false"
+            placeholder="https://app.example/metrics&#10;http://localhost:8000/metrics"
+          ></textarea>
+        </label>
+        <label>Mode
+          <select id="targetMode">
+            <option value="recurring" selected>Recurring</option>
+            <option value="once">Run once</option>
+          </select>
+        </label>
+        <label>Name (optional)
+          <input id="targetName" placeholder="slug" size="14" autocomplete="off" />
+        </label>
+        <label>Allow prefixes (optional)
+          <input id="targetAllow" placeholder="http_,beruang_" size="20" autocomplete="off" />
+        </label>
+        <label>Control token (optional)
+          <input id="controlToken" type="password" placeholder="x-control-token" size="16" autocomplete="off" />
+        </label>
+        <button id="targetAdd" class="btn primary"><i data-lucide="plus"></i>Add</button>
+      </div>
+      <div id="targetsError" class="targets-error hidden"></div>
+      <div class="queue-actions">
+        <button id="queuePause" class="btn" title="Hold manual jobs (recurring keeps running)">
+          <i data-lucide="pause"></i>Pause
+        </button>
+        <button id="queueResume" class="btn" title="Release held manual jobs">
+          <i data-lucide="play"></i>Run
+        </button>
+        <button id="queueClear" class="btn" title="Cancel all pending jobs">
+          <i data-lucide="eraser"></i>Clear pending
+        </button>
+      </div>
+      <h3 class="subhead">Targets</h3>
+      <div id="targetList" class="target-list">
+        <span class="status-empty">Connect to a collector to manage targets.</span>
+      </div>
+      <h3 class="subhead">Queue</h3>
+      <div id="queueList" class="queue-list">
+        <span class="status-empty">not connected</span>
+      </div>
+    </section>
+
     <section class="cards" aria-label="summary">
       <article class="stat-card">
         <header><i data-lucide="hash"></i>Total Requests</header>

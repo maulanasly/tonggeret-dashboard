@@ -5,6 +5,7 @@
 import { DataSource } from './duckdb_client.js';
 import { HotClient } from './query_client.js';
 import { StatusClient } from './status_client.js';
+import { TargetsClient } from './targets_client.js';
 import { Queries } from './queries.js';
 import { WorkerEngine } from './duckdb_worker.js';
 import { Charts } from './charts.js';
@@ -72,9 +73,11 @@ async function refresh({ reconnect }) {
         await DataSource.connect(source, setStatusCb);
       }
       connectedUrl = source;
-      // Poll collector status from the connected base (proxied by the
-      // dashboard in split-process mode; same-origin single-binary too).
+      // Poll collector status + targets/queue from the connected base
+      // (proxied by the dashboard in split-process mode; same-origin
+      // single-binary too).
       StatusClient.watch(connectedUrl);
+      TargetsClient.watch(connectedUrl);
     }
     const data = useHot
       ? await HotClient.refreshAll(range, setStatusCb)
@@ -124,6 +127,7 @@ function boot() {
   Cards.reset();
   Charts.init();
   StatusClient.stop();
+  TargetsClient.init();
   Controls.init({ onRefresh: refresh, onCustom: runCustom });
   Controls.loadPersisted();
   if (!Controls.getSource()) {
