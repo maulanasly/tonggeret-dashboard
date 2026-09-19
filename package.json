@@ -9,7 +9,7 @@
     "mock-server": "node scripts/mock-server.mjs --port 8080",
     "gen-mock": "node scripts/generate-mock-parquet.mjs",
     "build": "node scripts/build-singlefile.mjs",
-    "test": "node --test js/queries.test.js"
+    "test": "node --test js/*.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -40,6 +40,23 @@ Example:
 curl -s 'http://localhost:8080/api/v1/query_range?query=http_requests_total&start=1700000000&end=1700003600&step=60' | head -c 400
 ```
 
+## Dashboard data sources (hot vs cold)
+
+On connect, the dashboard probes `<base>/api/v1/labels`. When the source
+is a collector, it uses **hot mode**: preset charts are built from
+`query_range` JSON (no DuckDB-Wasm download, works seconds after startup).
+Otherwise it falls back to cold Parquet via DuckDB-Wasm (range requests or
+full fetch). The mode badge shows `via query-range` or the Parquet access
+mode. Hot-mode approximations (documented, display-only):
+
+- steps track the scrape cadence (`1h`→15s, `24h`→5m, all→10m); counter
+  charts need two scrapes before the first bucket appears;
+- throughput = per-series counter diffs (restarts clamp to 0), latency avg
+  = sum/count diffs, **p99 is absent hot** (no histogram math in the client);
+- errors group the same `http_requests_total` series by path;
+- the custom visualizer plots latest-per-bucket values (its agg selector
+  applies to the Parquet path; the preview shows the request URL instead).
+
 ## Series catalog
 
 Every stored sample gains a `scrape_target` label (closed set from
