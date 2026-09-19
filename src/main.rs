@@ -1,18 +1,17 @@
 //! `collector`: Prometheus scrape → Fjall hot store → Parquet history.
 //!
-//! Two roles share one binary:
+//! Roles:
 //!
-//! * `collector worker [config]` (default) — scrape loop + storage + hot
-//!   APIs + `GET /api/v1/status` + the control API. The only process that
-//!   opens Fjall.
+//! * `collector [config]` (no role) — **single binary**: worker + dashboard
+//!   UI on one port. Pre-split behaviour, kept for backward compatibility.
+//! * `collector worker [config]` — worker only (no UI): scrape loop +
+//!   storage + hot APIs + `GET /api/v1/status` + control API. The only
+//!   process that opens Fjall.
 //! * `collector serve [config]` — read-only dashboard: serves `dist/` and
 //!   the cold Parquet locally and reverse-proxies the hot APIs + status +
 //!   control API to `COLLECTOR_UPSTREAM` (`COLLECTOR_LISTEN` /
 //!   `COLLECTOR_FJALL_DIR` / `COLLECTOR_UPSTREAM` /
-//!   `COLLECTOR_CONTROL_TOKEN` env overrides apply to both).
-//!
-//! `collector [config]` stays worker, so the single-binary deployment is
-//! unchanged.
+//!   `COLLECTOR_CONTROL_TOKEN` env overrides apply to every role).
 //!
 //! The worker runs **one executor task**: an interval tick enqueues a
 //! `Scheduled` job per enabled recurring target, and the same task drains
@@ -36,8 +35,10 @@ const PURGE_CHECK_SECS: u64 = 3600;
 const DEFAULT_CONFIG: &str = "collector.toml";
 
 enum Role {
-    /// Scrape + store + hot APIs + control API. Opens Fjall; no `dist/`.
-    Worker,
+    /// Scrape + store + hot APIs + control API. Opens Fjall. `serve_ui` is
+    /// true for the legacy single-binary form (`collector <config>`), which
+    /// also serves `dist/`; the explicit `worker` split role does not.
+    Worker { serve_ui: bool },
     /// Read-only dashboard. Never opens Fjall.
     Serve,
 }
@@ -50,12 +51,13 @@ fn parse_args() -> (Role, String) {
             args.next().unwrap_or_else(|| DEFAULT_CONFIG.to_string()),
         ),
         Some("worker") => (
-            Role::Worker,
+            Role::Worker { serve_ui: false },
             args.next().unwrap_or_else(|| DEFAULT_CONFIG.to_string()),
         ),
-        // Backward compatible: a bare path (or nothing) means worker.
-        Some(path) => (Role::Worker, path.to_string()),
-        None => (Role::Worker, DEFAULT_CONFIG.to_string()),
+        // Backward compatible: a bare path (or nothing) is the single-binary
+        // form — worker + embedded UI on one port.
+        Some(path) => (Role::Worker { serve_ui: true }, path.to_string()),
+        None => (Role::Worker { serve_ui: true }, DEFAULT_CONFIG.to_string()),
     }
 }
 
@@ -74,13 +76,15 @@ async fn main() {
         }
     };
     match role {
-        Role::Worker => run_worker(cfg).await,
+        Role::Worker { serve_ui } => run_worker(cfg, serve_ui).await,
         Role::Serve => run_serve(cfg).await,
     }
 }
 
-/// Worker: own the store, run the unified executor, serve the APIs.
-async fn run_worker(cfg: Arc<config::Config>) {
+/// Worker: own the store, run the unified executor, serve the APIs. When
+/// `serve_ui` is set (single-binary form) it also serves `static_dir` at `/`,
+/// so `collector <config>` keeps the pre-split behaviour.
+async fn run_worker(cfg: Arc<config::Config>, serve_ui: bool) {
     let mut fjall = tonggeret::FjallConfig::new(&cfg.fjall.dir);
     fjall.cold_storage_dir = Some(cfg.fjall.cold_dir.clone());
     fjall.retention = Duration::from_secs(cfg.fjall.retention_days.saturating_mul(24 * 3600));
@@ -154,7 +158,7 @@ async fn run_worker(cfg: Arc<config::Config>) {
     };
     tokio::spawn(executor.run());
 
-    let app = serve::worker_router(
+    let mut app = serve::worker_router(
         cold_dir,
         buffer,
         tracker,
@@ -162,7 +166,18 @@ async fn run_worker(cfg: Arc<config::Config>) {
         queue,
         cfg.control_token.clone(),
     );
-    serve_until_shutdown(app, &cfg.listen, "collector worker").await;
+    // Single-binary form serves the dashboard itself (pre-split behaviour);
+    // the explicit `worker` split role leaves UI serving to `serve`.
+    if serve_ui {
+        app = serve::serve_ui(app, cfg.static_dir.clone());
+        tracing::info!(static_dir = %cfg.static_dir.display(), "serving dashboard UI");
+    }
+    let what = if serve_ui {
+        "collector (single binary)"
+    } else {
+        "collector worker"
+    };
+    serve_until_shutdown(app, &cfg.listen, what).await;
     let _ = tonggeret::shutdown();
 }
 

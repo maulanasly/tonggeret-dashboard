@@ -185,6 +185,13 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Attach the dashboard UI (`dist/`) as the router fallback. Used by the
+/// single-binary `collector <config>` form; the explicit `worker` split role
+/// leaves UI serving to `serve`.
+pub fn serve_ui(router: axum::Router, static_dir: PathBuf) -> axum::Router {
+    router.fallback_service(tower_http::services::ServeDir::new(static_dir))
+}
+
 /// State for the worker status handler: tracker + buffer occupancy + cold dir.
 #[derive(Clone)]
 struct StatusCtx {
@@ -1202,5 +1209,32 @@ mod tests {
         assert_eq!(body["method"], "POST");
         assert_eq!(body["token"], "tok");
         assert!(body["body"].as_str().unwrap().contains("urls"));
+    }
+
+    #[tokio::test]
+    async fn single_binary_ui_fallback_serves_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<h1>dashboard-ui</h1>").unwrap();
+        let app = super::serve_ui(
+            worker_app(dir.path(), seeded_buffer()),
+            dir.path().to_path_buf(),
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("dashboard-ui"));
+        // API routes still win over the UI fallback.
+        let (status, _) = get(worker_app(dir.path(), seeded_buffer()), "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

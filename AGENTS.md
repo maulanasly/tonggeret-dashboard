@@ -31,7 +31,7 @@ Rust 1.85+ (collector) · Node 18+ (dashboard `npm run` scripts only) ·
 ## Structure
 
 ```
-src/main.rs      role dispatch (worker/serve) → worker: init + unified executor (tick + queue) + serve
+src/main.rs      roles: single-binary (worker + UI) / worker / serve → init + unified executor (tick + queue) + serve
 src/config.rs    collector.toml + COLLECTOR_LISTEN / COLLECTOR_FJALL_DIR / COLLECTOR_UPSTREAM / COLLECTOR_CONTROL_TOKEN + validate()
 src/scrape.rs    fetch → prometheus-parse → allowlist/denylist → record_* + recent buffer + status ; outcome series
 src/targets.rs   TargetRegistry: config + persisted dynamic targets (CRUD, dedupe, caps, atomic JSON)
