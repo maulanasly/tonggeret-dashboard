@@ -161,6 +161,29 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border-radius: 999px;
   padding: 3px 10px;
 }
+.badge[data-status="ok"] { color: var(--good); border-color: var(--good); }
+.badge[data-status="degraded"] { color: #f59e0b; border-color: #f59e0b; }
+.badge[data-status="starting"] { color: #60a5fa; border-color: #60a5fa; }
+.badge[data-status="offline"] { color: var(--bad); border-color: var(--bad); }
+
+.status-body { display: grid; gap: 6px; font-size: 0.82rem; }
+.status-meta { color: var(--muted); font-size: 0.78rem; margin-bottom: 2px; }
+.status-empty { color: var(--muted); }
+.status-row {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) auto 2fr;
+  gap: 10px;
+  align-items: center;
+  padding: 5px 0;
+  border-top: 1px solid var(--border);
+}
+.status-row:first-child { border-top: none; }
+.status-name { font-weight: 600; }
+.status-state { font-size: 0.72rem; border-radius: 999px; padding: 2px 8px; border: 1px solid var(--border); color: var(--muted); }
+.status-state[data-state="ok"] { color: var(--good); border-color: var(--good); }
+.status-state[data-state="bad"], .status-state[data-state="fetch_error"], .status-state[data-state="parse_error"] { color: var(--bad); border-color: var(--bad); }
+.status-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 
 .chart { width: 100%; height: 300px; }
 .chart-fallback { color: var(--muted); padding: 40px; text-align: center; }
@@ -262,6 +285,16 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   <div id="errorBanner" class="banner hidden" role="alert"></div>
 
   <main id="main" class="layout">
+    <section class="panel status-panel" aria-label="collector status">
+      <header>
+        <h2><i data-lucide="server-cog"></i>Collector status</h2>
+        <span id="collectorBadge" class="badge" data-status="offline">not connected</span>
+      </header>
+      <div id="collectorStatus" class="status-body">
+        <span class="status-empty">Connect to a collector to see worker status.</span>
+      </div>
+    </section>
+
     <section class="cards" aria-label="summary">
       <article class="stat-card">
         <header><i data-lucide="hash"></i>Total Requests</header>
@@ -1147,6 +1180,148 @@ const HotClient = {
 };
 
 
+/* ---- js/status_client.js ---- */
+//! Collector status client: poll `GET /api/v1/status` and render a compact
+//! worker/target health panel. Display-only, like the rest of the dashboard:
+//! no math beyond formatting, no server query code.
+//!
+//! In split-process mode the dashboard proxies this endpoint, so the same
+//! URL works when the UI is served by the worker (single-binary) or by the
+//! read-only `serve` role. An unreachable worker yields an `offline` status.
+
+const STATUS_POLL_MS = 15000;
+
+const StatusClient = {
+  baseUrl: '',
+  timer: null,
+
+  /// Normalize either a worker snapshot or an offline body into one shape.
+  normalize(raw) {
+    const targets = Array.isArray(raw?.targets) ? raw.targets : [];
+    return {
+      status: typeof raw?.status === 'string' ? raw.status : 'offline',
+      uptimeSecs: Number(raw?.uptime_secs ?? 0),
+      intervalSecs: Number(raw?.interval_secs ?? 0),
+      bufferSamples: Number(raw?.buffer?.samples ?? 0),
+      bufferCap: Number(raw?.buffer?.cap ?? 0),
+      coldFiles: Number(raw?.cold_files ?? 0),
+      error: typeof raw?.error === 'string' ? raw.error : null,
+      targets: targets.map((t) => ({
+        name: String(t?.name ?? '(unknown)'),
+        url: String(t?.url ?? ''),
+        lastStatus: t?.last_status == null ? null : String(t.last_status),
+        lastScrapeTs: t?.last_scrape_ts == null ? null : Number(t.last_scrape_ts),
+        lastSamples: Number(t?.last_samples ?? 0),
+        lastDurationMs: Number(t?.last_duration_ms ?? 0),
+        consecutiveFailures: Number(t?.consecutive_failures ?? 0),
+        totals: {
+          ok: Number(t?.totals?.ok ?? 0),
+          fetchError: Number(t?.totals?.fetch_error ?? 0),
+          parseError: Number(t?.totals?.parse_error ?? 0),
+        },
+      })),
+    };
+  },
+
+  /// Human "time since" text for a unix-seconds timestamp.
+  ageText(ts, nowSecs) {
+    if (ts == null || !Number.isFinite(ts)) return 'never';
+    const delta = Math.max(0, Math.floor(nowSecs - ts));
+    if (delta < 60) return `${delta}s ago`;
+    if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+    if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
+    return `${Math.floor(delta / 86400)}d ago`;
+  },
+
+  /// Compact uptime text for the summary line.
+  uptimeText(secs) {
+    if (!Number.isFinite(secs) || secs <= 0) return '0s';
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+    return `${Math.floor(secs / 86400)}d`;
+  },
+
+  /// Fetch `/api/v1/status`; never throws — failures become `offline`.
+  async fetchSnapshot(baseUrl) {
+    const base = String(baseUrl ?? '').trim().replace(/\/$/, '');
+    if (base === '') return { status: 'offline', error: 'no source' };
+    try {
+      const res = await fetch(`${base}/api/v1/status`);
+      if (!res.ok) return { status: 'offline', error: `HTTP ${res.status}` };
+      return await res.json();
+    } catch (err) {
+      return { status: 'offline', error: String(err?.message ?? err) };
+    }
+  },
+
+  /// Poll `baseUrl` immediately and every 15s; render into the panel.
+  watch(baseUrl) {
+    this.stop();
+    this.baseUrl = String(baseUrl ?? '').trim().replace(/\/$/, '');
+    const tick = async () => {
+      const snapshot = this.normalize(await this.fetchSnapshot(this.baseUrl));
+      this.render(snapshot);
+    };
+    tick();
+    this.timer = setInterval(tick, STATUS_POLL_MS);
+  },
+
+  stop() {
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  },
+
+  /// Render a normalized snapshot into `#collectorBadge` + `#collectorStatus`.
+  render(snapshot) {
+    const badge = document.getElementById('collectorBadge');
+    const body = document.getElementById('collectorStatus');
+    if (!body) return;
+    if (badge) {
+      badge.textContent = snapshot.status;
+      badge.dataset.status = snapshot.status;
+    }
+    const esc = (s) =>
+      String(s).replace(
+        /[&<>"']/g,
+        (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+      );
+    if (snapshot.status === 'offline') {
+      body.innerHTML = '';
+      const msg = document.createElement('span');
+      msg.className = 'status-empty';
+      msg.textContent = `collector offline${snapshot.error ? `: ${snapshot.error}` : ''}`;
+      body.appendChild(msg);
+      return;
+    }
+    const now = Date.now() / 1000;
+    const meta =
+      `uptime ${this.uptimeText(snapshot.uptimeSecs)} · interval ${snapshot.intervalSecs}s · ` +
+      `buffer ${snapshot.bufferSamples}/${snapshot.bufferCap} · cold ${snapshot.coldFiles} file(s)`;
+    const rows = snapshot.targets
+      .map((t) => {
+        const state = t.consecutiveFailures > 0 ? 'bad' : (t.lastStatus ?? 'idle');
+        const errs = t.totals.fetchError + t.totals.parseError;
+        const detail =
+          `${this.ageText(t.lastScrapeTs, now)} · ${t.lastSamples} samples · ` +
+          `${t.lastDurationMs}ms · ok ${t.totals.ok} / err ${errs}`;
+        return (
+          `<div class="status-row">` +
+          `<span class="status-name">${esc(t.name)}</span>` +
+          `<span class="status-state" data-state="${esc(state)}">${esc(state)}</span>` +
+          `<span class="status-detail">${esc(detail)}</span>` +
+          `</div>`
+        );
+      })
+      .join('');
+    body.innerHTML =
+      `<div class="status-meta">${esc(meta)}</div>` +
+      (rows || '<span class="status-empty">no targets configured</span>');
+  },
+};
+
+
 /* ---- js/charts.js ---- */
 //! ECharts wrappers: dark-theme time-series + error charts with graceful
 //! empty/loading states. Expects `window.echarts` from the vendor script tag.
@@ -1654,6 +1829,9 @@ async function refresh({ reconnect }) {
         await DataSource.connect(source, setStatusCb);
       }
       connectedUrl = source;
+      // Poll collector status from the connected base (proxied by the
+      // dashboard in split-process mode; same-origin single-binary too).
+      StatusClient.watch(connectedUrl);
     }
     const data = useHot
       ? await HotClient.refreshAll(range, setStatusCb)
@@ -1702,6 +1880,7 @@ function boot() {
   if (window.lucide?.createIcons) window.lucide.createIcons();
   Cards.reset();
   Charts.init();
+  StatusClient.stop();
   Controls.init({ onRefresh: refresh, onCustom: runCustom });
   Controls.loadPersisted();
   if (!Controls.getSource()) {

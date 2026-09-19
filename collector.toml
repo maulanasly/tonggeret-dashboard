@@ -1,12 +1,22 @@
 # tonggeret-dashboard collector config.
 #
 # Copy to your deploy dir and point `--config` at it. Env overrides:
-# `COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`.
+# `COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`, `COLLECTOR_UPSTREAM`.
+#
+# Two roles share this file:
+#   collector worker collector.toml   # scrape + store + hot API + status
+#   collector serve  collector.toml   # read-only UI, proxies the worker
+# `collector collector.toml` (no role) stays worker.
 
 # Seconds between scrape passes (targets scraped sequentially).
 interval_secs = 15
 # Serve address for the dashboard + /metrics + /telemetry/parquet + /api/files.
+# In split-process mode set the worker to loopback and the dashboard public,
+# e.g. via COLLECTOR_LISTEN=127.0.0.1:8081 / 0.0.0.0:8080.
 listen = "0.0.0.0:8080"
+# Worker base URL used by the `serve` role to reverse-proxy the hot API and
+# `/api/v1/status`. Ignored by `worker`.
+upstream = "http://127.0.0.1:8081"
 # Prebuilt UI bundle served at `/`.
 static_dir = "dist"
 # Per-target sample cap per scrape (overflow counted, scrape continues).

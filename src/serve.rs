@@ -1,12 +1,22 @@
-//! HTTP surface: prebuilt UI + self `/metrics` + cold Parquet + manifest +
-//! hot range queries.
+//! HTTP surface, split by role.
 //!
-//! The UI bundle (`dist/`, served at `/`) is the same DuckDB-Wasm app the
-//! mock server hosts: it resolves `<base>/telemetry/parquet` (newest cold
-//! file, Range-capable via tonggeret) or the `/api/files` manifest below.
-//! `/api/v1/query_range` answers Prometheus-shaped JSON from the in-memory
-//! recent-samples buffer (process lifetime; cold Parquet stays the history
-//! of record).
+//! * [`worker_router`] — the collector process: self `/metrics`, hot range
+//!   queries, the cold-file surface, and the `GET /api/v1/status` contract.
+//!   It owns the Fjall store (via the engine) and is the only writer.
+//! * [`dashboard_router`] — the read-only frontend: serves `dist/` and the
+//!   cold-file surface from the shared cold directory, and reverse-proxies
+//!   the hot APIs + status to `COLLECTOR_UPSTREAM`. It never touches Fjall.
+//!
+//! The cold-file surface is identical on both roles: `serve` reads
+//! `metrics_cold_*.parquet` locally so history keeps working while the
+//! worker is down. `worker_router` keeps it too (direct access / backward
+//! compatibility); the primary dashboard path is the local read.
+//!
+//! NOTE: deliberately *no* `track` middleware on either role. The worker
+//! mirrors scraped samples into the same registry with an extra
+//! `scrape_target` label, so self `http_*` series (3 labels) would collide
+//! with scraped ones (4 labels) and panic the registry. Self-observability
+//! is the `collector_*` outcome series instead.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,51 +24,187 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::extract::{Path as UrlPath, Query as UrlQuery, Request, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use axum::routing::get;
 use tower::ServiceExt as _;
 
 use crate::query::{self, QueryError, RecentBuffer};
+use crate::status::{StatusSnapshot, StatusTracker};
 
 /// Cold export filename shape (`tonggeret::storage` convention).
 const COLD_PREFIX: &str = "metrics_cold_";
 
-/// Build the full router: UI, scrape-compat endpoints, telemetry, hot queries.
+/// Worker router: hot APIs, `/metrics`, cold surface, status contract.
 ///
-/// NOTE: deliberately *no* `track` middleware here. The collector mirrors
-/// scraped samples into this same registry with an extra `scrape_target`
-/// label, so self `http_*` series (3 labels) would collide with scraped
-/// ones (4 labels) and panic the registry. Self-observability is the
-/// `collector_*` outcome series instead.
-pub fn router(static_dir: PathBuf, cold_dir: PathBuf, buffer: Arc<RecentBuffer>) -> axum::Router {
-    let files_dir = Arc::new(cold_dir.clone());
-    let serve_dir = files_dir.clone();
+/// `tracker` is updated on the scrape path; this router only reads it.
+pub fn worker_router(
+    cold_dir: PathBuf,
+    buffer: Arc<RecentBuffer>,
+    tracker: Arc<StatusTracker>,
+) -> axum::Router {
+    let status_ctx = StatusCtx {
+        tracker,
+        buffer: buffer.clone(),
+        cold_dir: Arc::new(cold_dir.clone()),
+    };
     axum::Router::new()
-        .route(
-            "/api/files",
-            axum::routing::get(move || {
-                let dir = files_dir.clone();
-                async move { Json(list_cold_files(&dir)) }
-            }),
-        )
+        .route("/api/files", files_route(cold_dir.clone()))
         .route(
             "/api/v1/query_range",
-            axum::routing::get(query_range).with_state(buffer.clone()),
+            get(query_range).with_state(buffer.clone()),
         )
+        .route("/api/v1/labels", get(label_names).with_state(buffer))
         .route(
-            "/api/v1/labels",
-            axum::routing::get(label_names).with_state(buffer),
+            "/api/v1/status",
+            get(collector_status).with_state(status_ctx),
         )
         .route(
             "/telemetry/cold/{file}",
-            axum::routing::get(serve_cold_file).with_state(serve_dir),
+            get(serve_cold_file).with_state(Arc::new(cold_dir.clone())),
         )
         .route(
             "/metrics",
-            axum::routing::get(tonggeret::middleware::axum::prometheus_handler),
+            get(tonggeret::middleware::axum::prometheus_handler),
         )
+        .route("/healthz", get(healthz))
+        .merge(tonggeret::middleware::axum::parquet_route(cold_dir))
+}
+
+/// Read-only dashboard router: `dist/` + local cold files, hot API/status
+/// reverse-proxied to `upstream`. Never opens Fjall. Serves the cold surface
+/// locally so history keeps working while the worker is unreachable.
+pub fn dashboard_router(static_dir: PathBuf, cold_dir: PathBuf, upstream: &str) -> axum::Router {
+    let proxy = ProxyCtx {
+        client: reqwest::Client::new(),
+        upstream: Arc::new(upstream.trim_end_matches('/').to_string()),
+    };
+    axum::Router::new()
+        .route("/api/files", files_route(cold_dir.clone()))
+        .route(
+            "/api/v1/query_range",
+            get(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route(
+            "/api/v1/labels",
+            get(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route("/api/v1/status", get(dashboard_status).with_state(proxy))
+        .route(
+            "/telemetry/cold/{file}",
+            get(serve_cold_file).with_state(Arc::new(cold_dir.clone())),
+        )
+        .route("/healthz", get(healthz))
         .merge(tonggeret::middleware::axum::parquet_route(cold_dir))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
+}
+
+/// `/api/files` manifest from a cold directory (shared by both roles).
+fn files_route(cold_dir: PathBuf) -> axum::routing::MethodRouter {
+    let dir = Arc::new(cold_dir);
+    get(move || {
+        let dir = dir.clone();
+        async move { Json(list_cold_files(&dir)) }
+    })
+}
+
+/// Process-liveness endpoint for both roles (systemd / reverse-proxy health).
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// State for the worker status handler: tracker + buffer occupancy + cold dir.
+#[derive(Clone)]
+struct StatusCtx {
+    tracker: Arc<StatusTracker>,
+    buffer: Arc<RecentBuffer>,
+    cold_dir: Arc<PathBuf>,
+}
+
+/// `GET /api/v1/status` — worker health snapshot (see [`crate::status`]).
+async fn collector_status(State(ctx): State<StatusCtx>) -> Json<StatusSnapshot> {
+    let (samples, cap) = ctx.buffer.occupancy();
+    let cold_files = list_cold_files(ctx.cold_dir.as_path()).len();
+    Json(ctx.tracker.snapshot(samples, cap, cold_files))
+}
+
+/// Dashboard proxy state: HTTP client + worker base URL.
+#[derive(Clone)]
+struct ProxyCtx {
+    client: reqwest::Client,
+    upstream: Arc<String>,
+}
+
+/// Reverse-proxy `query_range` / `labels` to the worker. On any upstream
+/// failure the dashboard answers 503 (Prometheus-shaped error body) instead
+/// of hanging — the UI then falls back to cold Parquet.
+async fn proxy_upstream(State(ctx): State<ProxyCtx>, req: Request) -> Response {
+    let path_query = req.uri().path_and_query().map_or("", |p| p.as_str());
+    let url = format!("{}{}", ctx.upstream, path_query);
+    match ctx.client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => passthrough(resp).await,
+        Ok(resp) => gateway_error(&format!("upstream returned {}", resp.status())),
+        Err(e) => gateway_error(&format!("collector offline: {e}")),
+    }
+}
+
+/// Proxy the status endpoint, but always answer 200: when the worker is
+/// unreachable the dashboard returns `{"status":"offline", ...}` so the UI
+/// can render a status indicator instead of an error.
+async fn dashboard_status(State(ctx): State<ProxyCtx>) -> Response {
+    let url = format!("{}/api/v1/status", ctx.upstream);
+    match ctx.client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(body) => Json(body).into_response(),
+                Err(e) => offline_status(&format!("bad upstream status body: {e}")),
+            },
+            Err(e) => offline_status(&format!("upstream read failed: {e}")),
+        },
+        Ok(resp) => offline_status(&format!("upstream returned {}", resp.status())),
+        Err(e) => offline_status(&format!("collector offline: {e}")),
+    }
+}
+
+/// Copy an upstream response through (status + content-type + body).
+async fn passthrough(resp: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    match resp.bytes().await {
+        Ok(bytes) => {
+            let mut builder = Response::builder().status(status);
+            if let Some(ct) = content_type {
+                builder = builder.header(CONTENT_TYPE, ct);
+            }
+            builder
+                .body(axum::body::Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(e) => gateway_error(&format!("upstream read failed: {e}")),
+    }
+}
+
+/// Prometheus-shaped 503 for a failed hot-query proxy.
+fn gateway_error(detail: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "status": "error",
+            "errorType": "unavailable",
+            "error": detail,
+        })),
+    )
+        .into_response()
+}
+
+/// Always-200 offline status body for the dashboard status endpoint.
+fn offline_status(detail: &str) -> Response {
+    Json(serde_json::json!({
+        "status": "offline",
+        "error": detail,
+    }))
+    .into_response()
 }
 
 /// Prometheus-shaped range query over recent samples:
@@ -238,7 +384,21 @@ mod tests {
         assert!(dir.path().join("keep.txt").exists());
     }
 
+    use crate::config::TargetConfig;
     use crate::query::{BufferedSample, RecentBuffer};
+    use crate::scrape::ScrapeStatus;
+
+    fn tracker_for(names: &[&str]) -> Arc<StatusTracker> {
+        let targets: Vec<TargetConfig> = names
+            .iter()
+            .map(|n| TargetConfig {
+                name: (*n).to_string(),
+                url: format!("http://localhost/{n}/metrics"),
+                allow: vec!["http_".to_string()],
+            })
+            .collect();
+        Arc::new(StatusTracker::new(&targets, 15, 30))
+    }
 
     fn seeded_buffer() -> Arc<RecentBuffer> {
         let buffer = Arc::new(RecentBuffer::new(100));
@@ -252,6 +412,10 @@ mod tests {
             }],
         );
         buffer
+    }
+
+    fn worker_app(cold: &Path, buffer: Arc<RecentBuffer>) -> axum::Router {
+        super::worker_router(cold.to_path_buf(), buffer, tracker_for(&["app"]))
     }
 
     async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -270,11 +434,7 @@ mod tests {
     #[tokio::test]
     async fn query_range_serves_buffered_matrix() {
         let dir = tempfile::tempdir().unwrap();
-        let app = super::router(
-            dir.path().to_path_buf(),
-            dir.path().to_path_buf(),
-            seeded_buffer(),
-        );
+        let app = worker_app(dir.path(), seeded_buffer());
         let (status, body) = get(
             app,
             "/api/v1/query_range?query=http_x&start=1699999990&end=1700000010&step=60",
@@ -291,11 +451,7 @@ mod tests {
     #[tokio::test]
     async fn query_range_rejects_bad_params_as_prometheus_error() {
         let dir = tempfile::tempdir().unwrap();
-        let app = super::router(
-            dir.path().to_path_buf(),
-            dir.path().to_path_buf(),
-            seeded_buffer(),
-        );
+        let app = worker_app(dir.path(), seeded_buffer());
         let (status, body) = get(
             app,
             "/api/v1/query_range?query=http_x&start=1&end=2&step=0s",
@@ -308,10 +464,68 @@ mod tests {
     #[tokio::test]
     async fn labels_lists_buffered_names() {
         let dir = tempfile::tempdir().unwrap();
-        let app = super::router(
+        let app = worker_app(dir.path(), seeded_buffer());
+        let (status, body) = get(app, "/api/v1/labels").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "success", "data": ["http_x"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_reports_collector_health() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "metrics_cold_20240101T000000.parquet", 10);
+        let tracker = tracker_for(&["app"]);
+        tracker.record("app", ScrapeStatus::Ok, 3, 9);
+
+        let app = super::worker_router(dir.path().to_path_buf(), seeded_buffer(), tracker);
+        let (status, body) = get(app, "/api/v1/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["interval_secs"], 15);
+        assert_eq!(body["retention_days"], 30);
+        assert_eq!(body["buffer"]["samples"], 1);
+        assert_eq!(body["buffer"]["cap"], 100);
+        assert_eq!(body["cold_files"], 1);
+        assert_eq!(body["targets"][0]["name"], "app");
+        assert_eq!(body["targets"][0]["last_status"], "ok");
+        assert_eq!(body["targets"][0]["last_samples"], 3);
+        assert_eq!(body["targets"][0]["consecutive_failures"], 0);
+    }
+
+    #[tokio::test]
+    async fn healthz_answers_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = worker_app(dir.path(), seeded_buffer());
+        let (status, body) = get(app, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+    }
+
+    /// Spin a mock worker exposing `/api/v1/labels` + `/api/v1/query_range`.
+    async fn spawn_mock_worker() -> String {
+        async fn labels() -> Json<serde_json::Value> {
+            Json(serde_json::json!({"status": "success", "data": ["http_x"]}))
+        }
+        let app = axum::Router::new().route("/api/v1/labels", axum::routing::get(labels));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn dashboard_proxies_hot_api_to_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = spawn_mock_worker().await;
+        let app = super::dashboard_router(
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
-            seeded_buffer(),
+            &upstream,
         );
         let (status, body) = get(app, "/api/v1/labels").await;
         assert_eq!(status, StatusCode::OK);
@@ -319,5 +533,39 @@ mod tests {
             body,
             serde_json::json!({"status": "success", "data": ["http_x"]})
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_serves_cold_and_reports_offline_without_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "metrics_cold_20240101T000000.parquet", 10);
+        // Port 1 is unreachable: the worker is "down".
+        let app = super::dashboard_router(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            "http://127.0.0.1:1",
+        );
+
+        // Cold history keeps working locally.
+        let (status, body) = get(app.clone(), "/api/files").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body[0],
+            "/telemetry/cold/metrics_cold_20240101T000000.parquet"
+        );
+
+        // Status always answers 200, flagged offline.
+        let (status, body) = get(app.clone(), "/api/v1/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "offline");
+
+        // Hot queries surface 503 instead of hanging.
+        let (status, body) = get(
+            app,
+            "/api/v1/query_range?query=http_x&start=1&end=2&step=60",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "error");
     }
 }

@@ -7,3 +7,4 @@ pub mod config;
 pub mod query;
 pub mod scrape;
 pub mod serve;
+pub mod status;

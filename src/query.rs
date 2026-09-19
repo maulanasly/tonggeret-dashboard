@@ -67,10 +67,10 @@ impl RecentBuffer {
         }
     }
 
-    /// Test hook: current length.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.inner.lock().map_or(0, |q| q.len())
+    /// Current occupancy and capacity, for the collector status snapshot.
+    #[must_use]
+    pub fn occupancy(&self) -> (usize, usize) {
+        (self.inner.lock().map_or(0, |q| q.len()), self.cap)
     }
 
     /// Append samples from one scrape of `target`; evict oldest past capacity.
@@ -622,7 +622,7 @@ mod tests {
                 sample(3, "m", 3.0, &[]),
             ],
         );
-        assert_eq!(b.len(), 2);
+        assert_eq!(b.occupancy(), (2, 2));
         let out = b
             .query(&RangeQuery {
                 start_micros: 0,
