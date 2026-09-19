@@ -75,9 +75,23 @@ function bundle(entry) {
   for (const b of bare) {
     if (!/from\s+['"]@duckdb\/duckdb-wasm['"]/.test(b)) parts.push(b);
   }
+  // Inlined modules share one scope: duplicate top-level declarations
+  // would be a runtime SyntaxError (frozen UI), so fail the build instead.
+  const declared = new Map();
   for (const file of order) {
     const rel = path.relative(ROOT, file);
-    parts.push(`\n/* ---- ${rel} ---- */\n` + stripModule(fs.readFileSync(file, 'utf8')));
+    const stripped = stripModule(fs.readFileSync(file, 'utf8'));
+    for (const line of stripped.split('\n')) {
+      const m = /^(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)/.exec(line);
+      if (!m) continue;
+      if (declared.has(m[1])) {
+        throw new Error(
+          `duplicate top-level declaration '${m[1]}' in ${declared.get(m[1])} and ${rel} — rename one`,
+        );
+      }
+      declared.set(m[1], rel);
+    }
+    parts.push(`\n/* ---- ${rel} ---- */\n` + stripped);
   }
   const code = parts.join('\n');
   if (/from\s+['"]\.\.?\//.test(code)) {

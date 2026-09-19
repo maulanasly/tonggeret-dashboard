@@ -9,7 +9,7 @@
 
 import { HotReshape } from './hot_reshape.js';
 
-function emit(onStatus, phase, detail) {
+function emitStatus(onStatus, phase, detail) {
   try {
     onStatus?.({ phase, detail: detail ?? '', at: Date.now() });
   } catch {
@@ -43,7 +43,7 @@ export const HotClient = {
     const url =
       `${this.baseUrl}/api/v1/query_range?query=${encodeURIComponent(selector)}` +
       `&start=${start}&end=${end}&step=${step}`;
-    emit(onStatus, 'querying', label ?? `querying ${selector}…`);
+    emitStatus(onStatus, 'querying', label ?? `querying ${selector}…`);
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
     const body = await res.json();
@@ -86,7 +86,7 @@ export const HotClient = {
       HotReshape.groupBySeries(visUniques.result),
     );
     const bucketSecs = { '1h': 15, '24h': 300, all: 600 }[range] ?? 300;
-    emit(onStatus, 'idle', `${throughput.length} bucket(s) via query_range`);
+    emitStatus(onStatus, 'idle', `${throughput.length} bucket(s) via query_range`);
     return {
       throughput,
       errors,
@@ -106,7 +106,7 @@ export const HotClient = {
     // Hot mode plots latest-per-bucket values; the agg selector applies to
     // the Parquet path only (noted in the SQL preview as the request URL).
     const rows = HotReshape.customFromGroups(HotReshape.groupBySeries(result));
-    emit(onStatus, 'idle', `${rows.length} bucket(s) via query_range`);
+    emitStatus(onStatus, 'idle', `${rows.length} bucket(s) via query_range`);
     return { url, rows };
   },
 };
