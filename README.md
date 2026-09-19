@@ -60,7 +60,6 @@ and queries remote Parquet files over HTTP (range requests when the server allow
 ### UI quickstart
 
 ```sh
-cd apps/tonggeret-dashboard
 npm run gen-mock      # build a realistic sample export (needs: npm i -D duckdb  OR  pip install duckdb)
 npm run mock-server   # http://localhost:8080/  (CORS + Range enabled)
 # open http://localhost:8080/ — source defaults to http://localhost:3000
