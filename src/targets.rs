@@ -35,19 +35,14 @@ pub enum Origin {
 }
 
 /// How a target is scheduled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Swept every `interval_secs`.
+    #[default]
     Recurring,
     /// Run only when enqueued (manual).
     Once,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Recurring
-    }
 }
 
 /// One scrape target in the runtime registry.
