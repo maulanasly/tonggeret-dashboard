@@ -11,6 +11,9 @@ listen = "0.0.0.0:8080"
 static_dir = "dist"
 # Per-target sample cap per scrape (overflow counted, scrape continues).
 max_samples_per_scrape = 5000
+# Recent-samples ring backing /api/v1/query_range (drop-oldest past the
+# cap; process lifetime only — cold Parquet stays the history of record).
+recent_buffer_samples = 20000
 # Largest accepted exposition body in bytes.
 max_body_bytes = 1048576
 

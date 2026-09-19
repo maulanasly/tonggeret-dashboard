@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use tonggeret_dashboard::config::TargetConfig;
+use tonggeret_dashboard::query::RecentBuffer;
 
 const EXPOSITION: &str = "# TYPE http_requests_total counter\n\
      http_requests_total{method=\"GET\",path=\"/\",status=\"200\"} 7\n\
@@ -55,8 +56,23 @@ async fn scrape_flows_to_registry_and_cold_parquet() {
             .collect(),
     };
     let client = reqwest::Client::new();
-    let status = tonggeret_dashboard::scrape::scrape_once(&client, &target, 5_000, 1_048_576).await;
+    let buffer = RecentBuffer::new(10_000);
+    let status =
+        tonggeret_dashboard::scrape::scrape_once(&client, &target, 5_000, 1_048_576, &buffer).await;
     assert_eq!(status, tonggeret_dashboard::scrape::ScrapeStatus::Ok);
+
+    // The same samples land in the recent buffer backing /api/v1/query_range.
+    let outcome = buffer
+        .query(&tonggeret_dashboard::query::RangeQuery {
+            name: "http_requests_total".to_string(),
+            matchers: vec![("scrape_target".to_string(), "mock".to_string())],
+            start_micros: 0,
+            end_micros: tonggeret_dashboard::query::now_micros(),
+            step_micros: 1_000_000,
+        })
+        .unwrap();
+    assert_eq!(outcome.series.len(), 1);
+    assert!(!outcome.series[0].buckets.is_empty());
 
     // Registry mirror proves mapping + recording (incl. histogram buckets
     // and the optional visitor series); `something_else` must be absent.

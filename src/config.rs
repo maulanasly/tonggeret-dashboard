@@ -57,6 +57,10 @@ pub struct Config {
     /// Per-target sample cap per scrape.
     #[serde(default = "default_max_samples")]
     pub max_samples_per_scrape: usize,
+    /// Recent-samples ring capacity backing `/api/v1/query_range`
+    /// (drop-oldest past the cap; see `query::RecentBuffer`).
+    #[serde(default = "default_recent_buffer_samples")]
+    pub recent_buffer_samples: usize,
     /// Largest accepted exposition body in bytes.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
@@ -82,6 +86,10 @@ fn default_static_dir() -> PathBuf {
 
 fn default_max_samples() -> usize {
     5_000
+}
+
+fn default_recent_buffer_samples() -> usize {
+    crate::query::DEFAULT_BUFFER_SAMPLES
 }
 
 fn default_max_body_bytes() -> usize {
@@ -182,6 +190,11 @@ impl Config {
                 "max_samples_per_scrape must be > 0".to_string(),
             ));
         }
+        if self.recent_buffer_samples == 0 {
+            return Err(ConfigError::Invalid(
+                "recent_buffer_samples must be > 0".to_string(),
+            ));
+        }
         if self.max_body_bytes < 1024 {
             return Err(ConfigError::Invalid(
                 "max_body_bytes must be >= 1024".to_string(),
@@ -235,6 +248,7 @@ mod tests {
         assert_eq!(cfg.interval_secs, 15);
         assert_eq!(cfg.listen, "0.0.0.0:8080");
         assert_eq!(cfg.max_samples_per_scrape, 5_000);
+        assert_eq!(cfg.recent_buffer_samples, 20_000);
         assert_eq!(cfg.fjall.retention_days, 30);
         assert_eq!(cfg.fjall.cold_purge_days, 32);
         // Visitor prefixes ship in the default allowlist.
@@ -247,6 +261,10 @@ mod tests {
     fn rejects_bad_configs() {
         let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
         cfg.interval_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
+        cfg.recent_buffer_samples = 0;
         assert!(cfg.validate().is_err());
 
         let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();

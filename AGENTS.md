@@ -33,8 +33,9 @@ Rust 1.85+ (collector) · Node 18+ (dashboard `npm run` scripts only) ·
 ```
 src/main.rs      init (fatal) → scrape loop → serve → graceful shutdown
 src/config.rs    collector.toml + COLLECTOR_LISTEN / COLLECTOR_FJALL_DIR + validate()
-src/scrape.rs    fetch → prometheus-parse → allowlist/denylist → record_* ; outcome series
-src/serve.rs     UI (dist/) + /metrics + /telemetry/parquet + /telemetry/cold/:file + /api/files
+src/scrape.rs    fetch → prometheus-parse → allowlist/denylist → record_* + recent buffer ; outcome series
+src/serve.rs     UI (dist/) + /metrics + /telemetry/parquet + /telemetry/cold/:file + /api/files + /api/v1/query_range (hot buffer)
+src/query.rs     RecentBuffer (bounded, drop-oldest) + selector/step parsing + Prometheus matrix JSON
 tests/collector_flow.rs  mock /metrics → registry mirror → cold Parquet (short retention)
 index.html js/ css/      DuckDB-Wasm dashboard (display only, same-origin)
 scripts/           mock-server (UI dev) + gen-mock-parquet (samples) + build-singlefile (dist/)

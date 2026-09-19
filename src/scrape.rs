@@ -14,6 +14,7 @@
 use prometheus_parse::{Sample, Scrape, Value};
 
 use crate::config::TargetConfig;
+use crate::query::{now_micros, BufferedSample, RecentBuffer};
 
 /// Label injected on every stored sample.
 pub const SCRAPE_TARGET_LABEL: &str = "scrape_target";
@@ -159,12 +160,15 @@ pub async fn fetch_body(
 
 /// One full scrape cycle for a target: fetch → parse → plan → store, plus
 /// `collector_*` outcome series. Every failure mode is counted, none throw.
+/// Planned samples are also mirrored into `buffer` (recent range queries).
 pub async fn scrape_once(
     client: &reqwest::Client,
     target: &TargetConfig,
     max_samples: usize,
     max_body: usize,
+    buffer: &RecentBuffer,
 ) -> ScrapeStatus {
+    let now = now_micros();
     let status = match fetch_body(client, &target.url, max_body).await {
         Err(e) => {
             tracing::warn!(target = %target.name, error = %e, "scrape fetch failed");
@@ -179,6 +183,18 @@ pub async fn scrape_once(
                 let (planned, dropped) =
                     plan_samples(&target.name, &scrape, &target.allow, max_samples);
                 store_samples(&planned);
+                buffer.push_batch(
+                    &target.name,
+                    &planned
+                        .iter()
+                        .map(|s| BufferedSample {
+                            ts_micros: now,
+                            name: s.name.clone(),
+                            value: s.value,
+                            labels: s.labels.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 record_outcome(&target.name, planned.len(), dropped);
                 tracing::debug!(
                     target = %target.name,

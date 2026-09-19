@@ -7,7 +7,7 @@
 //! purged. The same binary serves the dashboard UI, self `/metrics`,
 //! `/telemetry/parquet` (newest export), and `/api/files` (manifest).
 
-use tonggeret_dashboard::{config, scrape, serve};
+use tonggeret_dashboard::{config, query, scrape, serve};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +57,12 @@ async fn main() {
         "collector initialized"
     );
 
+    // Recent-samples ring for /api/v1/query_range. Memory budget note:
+    // `recent_buffer_samples` (default 20k ≈ ≤6 MiB) drop-oldest, written
+    // inline on the scrape path and read under a short mutex hold — no new
+    // background tasks, no second Fjall open (the engine forbids that).
+    let buffer = Arc::new(query::RecentBuffer::new(cfg.recent_buffer_samples));
+
     // Purge once at startup (crash leftovers), then hourly inside the loop.
     serve::purge_cold_files(&cold_dir, cfg.fjall.cold_purge_days);
 
@@ -66,6 +72,7 @@ async fn main() {
         .unwrap_or_else(|_| reqwest::Client::new());
     let loop_cfg = cfg.clone();
     let loop_cold = cold_dir.clone();
+    let loop_buffer = buffer.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(loop_cfg.interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -78,6 +85,7 @@ async fn main() {
                     target,
                     loop_cfg.max_samples_per_scrape,
                     loop_cfg.max_body_bytes,
+                    &loop_buffer,
                 )
                 .await;
             }
@@ -88,7 +96,7 @@ async fn main() {
         }
     });
 
-    let app = serve::router(cfg.static_dir.clone(), cold_dir);
+    let app = serve::router(cfg.static_dir.clone(), cold_dir, buffer);
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .unwrap_or_else(|e| {
