@@ -61,7 +61,9 @@ async function refresh({ reconnect }) {
   refreshing = true;
   showError('');
   try {
-    const source = Controls.getSource();
+    // Frozen connection: default to this page's own collector (same origin);
+    // the Advanced source input overrides it for static/remote hosting.
+    const source = Controls.getBase() || window.location.origin;
     const range = Controls.getRange();
     if (reconnect || connectedUrl !== source) {
       setStatus('metadata-loading', `connecting to ${source}…`);
@@ -92,7 +94,7 @@ async function refresh({ reconnect }) {
   } catch (err) {
     const msg = err?.message ?? String(err);
     const isHttp = /HTTP \d+|Failed to fetch|NetworkError|CORS/i.test(msg);
-    showError(`query failed: ${msg}${isHttp ? corsHint(Controls.getSource()) : ''}`);
+    showError(`query failed: ${msg}${isHttp ? corsHint(Controls.getBase() || window.location.origin) : ''}`);
     setStatus('error', msg);
   } finally {
     refreshing = false;
@@ -122,17 +124,27 @@ function setStatusCb({ phase, detail }) {
   setStatus(phase, detail);
 }
 
+/// Freeze/unfreeze the worker (halts all scraping) and refresh status.
+async function toggleFreeze() {
+  try {
+    if (TargetsClient.frozen) await TargetsClient.resumeWorker();
+    else await TargetsClient.freezeWorker();
+    await Promise.all([TargetsClient.refresh(), StatusClient.refreshNow()]);
+  } catch (err) {
+    showError(`freeze failed: ${err?.message ?? err}`);
+  }
+}
+
 function boot() {
   if (window.lucide?.createIcons) window.lucide.createIcons();
   Cards.reset();
   Charts.init();
   StatusClient.stop();
   TargetsClient.init();
-  Controls.init({ onRefresh: refresh, onCustom: runCustom });
+  Controls.init({ onRefresh: refresh, onCustom: runCustom, onFreeze: toggleFreeze });
   Controls.loadPersisted();
-  if (!Controls.getSource()) {
-    document.getElementById('srcInput').value = 'http://localhost:3000';
-  }
+  // Keep the top freeze toggle in sync with the worker's actual state.
+  StatusClient.onSnapshot = (snapshot) => Controls.setFreeze(snapshot.frozen);
   setStatus('idle', 'initializing…');
   // Engine warms up in the background; first refresh connects on demand.
   WorkerEngine.init(setStatusCb)

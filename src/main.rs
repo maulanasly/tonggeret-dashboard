@@ -187,7 +187,11 @@ impl Executor {
         loop {
             tokio::select! {
                 () = self.queue.notified() => {}
-                _ = tick.tick() => self.enqueue_scheduled(),
+                _ = tick.tick() => {
+                    if !self.queue.is_frozen() {
+                        self.enqueue_scheduled();
+                    }
+                }
             }
             self.drain().await;
             if last_purge.elapsed() >= Duration::from_secs(PURGE_CHECK_SECS) {
@@ -207,7 +211,8 @@ impl Executor {
     }
 
     /// Run queued jobs until none are eligible. Manual jobs run first while
-    /// running; while paused only scheduled jobs are eligible.
+    /// running; while paused only scheduled jobs are eligible; while frozen
+    /// (a superset of paused) nothing runs until unfreeze.
     async fn drain(&self) {
         while let Some(job) = self.queue.pop_next() {
             let target = TargetConfig {

@@ -6,6 +6,10 @@
 //! the "pause queue only" contract. One executor task consumes the queue, so
 //! entries never run concurrently.
 //!
+//! A separate **freeze** flag halts the whole executor (scheduled + manual);
+//! unlike pause, nothing runs until resume. The API stays up so the worker
+//! can be unfrozen.
+//!
 //! Finished jobs move to a bounded `recent` history for the UI; lifetime
 //! `done`/`failed` counters feed `GET /api/v1/status`.
 
@@ -96,6 +100,8 @@ pub struct QueueSummary {
     pub cap: usize,
     /// True when manual jobs are held.
     pub paused: bool,
+    /// True when the whole executor is frozen (nothing runs).
+    pub frozen: bool,
     /// Currently running job, if any.
     pub running: Option<Job>,
     /// Pending jobs (FIFO order).
@@ -122,6 +128,7 @@ struct Inner {
 pub struct JobQueue {
     cap: usize,
     paused: AtomicBool,
+    frozen: AtomicBool,
     inner: Mutex<Inner>,
     notify: Notify,
 }
@@ -133,6 +140,7 @@ impl JobQueue {
         Self {
             cap: cap.max(1),
             paused: AtomicBool::new(false),
+            frozen: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 pending: VecDeque::new(),
                 running: None,
@@ -233,14 +241,36 @@ impl JobQueue {
         self.paused.load(Ordering::SeqCst)
     }
 
+    /// Freeze the executor: nothing runs (scheduled included) until resume.
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    /// Unfreeze the executor and wake it to drain pending work.
+    pub fn unfreeze(&self) {
+        self.frozen.store(false, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    /// Whether the executor is frozen.
+    #[must_use]
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::SeqCst)
+    }
+
     /// Async wake-up future for the executor `select!`.
     pub async fn notified(&self) {
         self.notify.notified().await;
     }
 
     /// Next job to run: manual first while running, scheduled-only while
-    /// paused. Marks it `Running` and returns it.
+    /// paused. Marks it `Running` and returns it. Returns `None` while
+    /// frozen (nothing runs).
     pub fn pop_next(&self) -> Option<Job> {
+        if self.is_frozen() {
+            return None;
+        }
         let mut inner = self.lock();
         let paused = self.is_paused();
         let idx = inner
@@ -326,6 +356,7 @@ impl JobQueue {
             depth: inner.pending.len(),
             cap: self.cap,
             paused: self.paused.load(Ordering::SeqCst),
+            frozen: self.frozen.load(Ordering::SeqCst),
             running: inner.running.clone(),
             pending: inner.pending.iter().cloned().collect(),
             recent: inner.recent.iter().cloned().collect(),
@@ -450,5 +481,24 @@ mod tests {
         assert_eq!(snap.failed, 1);
         assert_eq!(snap.recent[0].state, JobState::Failed);
         assert_eq!(snap.recent[0].error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn freeze_halts_all_pops_until_unfreeze() {
+        let q = queue();
+        q.enqueue_manual("m", "http://m", vec![]).unwrap();
+        q.enqueue_scheduled("s", "http://s", vec![]).unwrap();
+        q.freeze();
+        assert!(q.is_frozen());
+        assert!(q.snapshot().frozen);
+        assert!(q.pop_next().is_none(), "frozen: nothing runs");
+        assert_eq!(q.snapshot().depth, 2, "jobs stay queued while frozen");
+
+        q.unfreeze();
+        assert!(!q.is_frozen());
+        let first = q.pop_next().unwrap();
+        assert_eq!(first.target, "m", "manual remains first after unfreeze");
+        let second = q.pop_next().unwrap();
+        assert_eq!(second.target, "s");
     }
 }

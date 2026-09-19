@@ -84,10 +84,16 @@ data/            LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history) 
   runtime state and persists only dynamic targets to `state.targets_file`
   atomically; config targets are immutable. `JobQueue::pop_next` is
   **manual-first while running, scheduled-only while paused** — pause never
-  stops the recurring sweep. Control endpoints mutate state and require
+  stops the recurring sweep; **freeze** (`worker/freeze`) is a superset that
+  halts everything until resume. Control endpoints mutate state and require
   `x-control-token` when `control_token`/`COLLECTOR_CONTROL_TOKEN` is set
   (browser stores it, `serve` forwards it). Errors: 422 bad input, 429
   queue/target cap, 404 unknown id.
+- **Frozen connection.** The dashboard binds to `window.location.origin` by
+  default (no source input); the top bar is a connection chip + freeze
+  toggle. The Advanced toggle reveals the source field for static hosting;
+  when non-empty it overrides same-origin. Keep it that way — don't
+  reintroduce a default remote source.
 - **JS stays display-only for data** (SQL builders + rendering). The
   Targets & queue panel (`js/targets_client.js`) is form wiring that calls
   the proxied control API; the worker owns all state. No client-side math.

@@ -60,9 +60,14 @@ Systemd units live in `deploy/`; see
 | GET/POST/DELETE | `/api/v1/queue` | queue snapshot / enqueue once jobs / clear pending |
 | POST | `/api/v1/queue/pause\|resume` | hold/release manual jobs (recurring keeps running) |
 | DELETE | `/api/v1/queue/{id}` | cancel one pending job |
+| GET | `/api/v1/worker` | worker-wide control state (`frozen`) |
+| POST | `/api/v1/worker/freeze\|resume` | freeze/unfreeze all scraping |
 
-The dashboard **Targets & queue** panel drives these. Mutations run in a
-single worker executor (manual jobs first, one at a time); when
+The dashboard is **frozen to its own collector** by default: the top bar
+shows a connection chip and a **Freeze/Unfreeze** toggle, no source input.
+The **Advanced** toggle reveals the source field for static hosting that
+points at a remote Parquet host (empty = this page's own origin). Mutations
+run in a single worker executor (manual jobs first, one at a time); when
 `control_token` is set they require an `x-control-token` header. Errors:
 422 bad input · 429 queue/target cap · 404 unknown id · 401 bad token.
 

@@ -11,12 +11,16 @@ const STATUS_POLL_MS = 15000;
 export const StatusClient = {
   baseUrl: '',
   timer: null,
+  /// Optional callback invoked with each normalized snapshot (e.g. to sync
+  /// the freeze toggle state).
+  onSnapshot: null,
 
   /// Normalize either a worker snapshot or an offline body into one shape.
   normalize(raw) {
     const targets = Array.isArray(raw?.targets) ? raw.targets : [];
     return {
       status: typeof raw?.status === 'string' ? raw.status : 'offline',
+      frozen: Boolean(raw?.queue?.frozen),
       uptimeSecs: Number(raw?.uptime_secs ?? 0),
       intervalSecs: Number(raw?.interval_secs ?? 0),
       bufferSamples: Number(raw?.buffer?.samples ?? 0),
@@ -77,6 +81,7 @@ export const StatusClient = {
     this.baseUrl = String(baseUrl ?? '').trim().replace(/\/$/, '');
     const tick = async () => {
       const snapshot = this.normalize(await this.fetchSnapshot(this.baseUrl));
+      this.onSnapshot?.(snapshot);
       this.render(snapshot);
     };
     tick();
@@ -90,7 +95,15 @@ export const StatusClient = {
     }
   },
 
-  /// Render a normalized snapshot into `#collectorBadge` + `#collectorStatus`.
+  /// Fetch + render one snapshot immediately (e.g. after freeze/resume).
+  async refreshNow() {
+    const snapshot = this.normalize(await this.fetchSnapshot(this.baseUrl));
+    this.onSnapshot?.(snapshot);
+    this.render(snapshot);
+  },
+
+  /// Render a normalized snapshot into `#collectorBadge` + `#collectorStatus`
+  /// and the top `#connChip`.
   render(snapshot) {
     const badge = document.getElementById('collectorBadge');
     const body = document.getElementById('collectorStatus');
@@ -99,6 +112,13 @@ export const StatusClient = {
       badge.textContent = snapshot.status;
       badge.dataset.status = snapshot.status;
     }
+    // Top connection chip: offline > frozen > overall status.
+    const chip = document.getElementById('connChip');
+    const chipText = document.getElementById('connChipText');
+    const chipStatus =
+      snapshot.status === 'offline' ? 'offline' : snapshot.frozen ? 'frozen' : snapshot.status;
+    if (chip) chip.dataset.status = chipStatus;
+    if (chipText) chipText.textContent = chipStatus;
     const esc = (s) =>
       String(s).replace(
         /[&<>"']/g,

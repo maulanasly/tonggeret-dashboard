@@ -93,6 +93,19 @@ pub fn worker_router(
             "/api/v1/targets/{id}",
             delete(remove_target).with_state(ctrl.clone()),
         )
+        // Control API: worker-wide freeze (halts scheduled + manual).
+        .route(
+            "/api/v1/worker",
+            get(worker_status).with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/worker/freeze",
+            post(freeze_worker).with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/worker/resume",
+            post(resume_worker).with_state(ctrl.clone()),
+        )
         // Control API: queue (pause/resume before the `{id}` wildcard).
         .route(
             "/api/v1/queue",
@@ -160,6 +173,14 @@ pub fn dashboard_router(static_dir: PathBuf, cold_dir: PathBuf, upstream: &str) 
         )
         .route(
             "/api/v1/queue/{*rest}",
+            any(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route(
+            "/api/v1/worker",
+            any(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route(
+            "/api/v1/worker/{*rest}",
             any(proxy_upstream).with_state(proxy),
         )
         .route(
@@ -207,6 +228,7 @@ async fn collector_status(State(ctx): State<StatusCtx>) -> Json<StatusSnapshot> 
             depth: q.depth,
             cap: q.cap,
             paused: q.paused,
+            frozen: q.frozen,
             running: q.running.map(|j| j.target),
             done: q.done,
             failed: q.failed,
@@ -475,6 +497,31 @@ async fn clear_queue(
     authorize(&ctx, &headers)?;
     let cancelled = ctx.queue.clear_pending();
     Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
+/// `GET /api/v1/worker` — worker-wide control state (`frozen`).
+async fn worker_status(State(ctx): State<ControlCtx>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "frozen": ctx.queue.is_frozen() }))
+}
+
+/// `POST /api/v1/worker/freeze` — halt the executor (scheduled + manual).
+async fn freeze_worker(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&ctx, &headers)?;
+    ctx.queue.freeze();
+    Ok(Json(serde_json::json!({ "frozen": true })))
+}
+
+/// `POST /api/v1/worker/resume` — lift the freeze and drain pending jobs.
+async fn resume_worker(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&ctx, &headers)?;
+    ctx.queue.unfreeze();
+    Ok(Json(serde_json::json!({ "frozen": false })))
 }
 
 /// Dashboard proxy state: HTTP client + worker base URL.
@@ -1155,6 +1202,86 @@ mod tests {
         // Reads stay open.
         let (status, _) = get(app, "/api/v1/queue").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn worker_freeze_and_resume_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let tracker = tracker_for(&["app"]);
+        let queue = Arc::new(JobQueue::new(16));
+        let app = control_app(dir.path(), registry, tracker, queue.clone(), None);
+
+        let (status, body) = request(app.clone(), "POST", "/api/v1/worker/freeze", "", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["frozen"], true);
+        assert!(queue.is_frozen());
+
+        let (status, body) = get(app.clone(), "/api/v1/worker").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["frozen"], true);
+
+        // Status surfaces the freeze for the chip.
+        let (_, body) = get(app.clone(), "/api/v1/status").await;
+        assert_eq!(body["queue"]["frozen"], true);
+
+        // Frozen: even a queued manual job does not run.
+        queue
+            .enqueue_manual("app", "http://localhost/app/metrics", vec![])
+            .unwrap();
+        assert!(queue.pop_next().is_none());
+        assert_eq!(queue.snapshot().depth, 1);
+
+        let (status, body) = request(app, "POST", "/api/v1/worker/resume", "", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["frozen"], false);
+        assert!(!queue.is_frozen());
+        assert!(queue.pop_next().is_some(), "resume lets pending work run");
+    }
+
+    #[tokio::test]
+    async fn worker_freeze_requires_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let tracker = tracker_for(&["app"]);
+        let queue = Arc::new(JobQueue::new(16));
+        let app = control_app(dir.path(), registry, tracker, queue, Some("s3cret".into()));
+
+        let (status, _) = request(app.clone(), "POST", "/api/v1/worker/freeze", "", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = request(
+            app,
+            "POST",
+            "/api/v1/worker/freeze",
+            "",
+            &[("x-control-token", "s3cret")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_proxies_worker_freeze() {
+        async fn frozen() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "frozen": true }))
+        }
+        let upstream =
+            axum::Router::new().route("/api/v1/worker/freeze", axum::routing::post(frozen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = super::dashboard_router(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            &format!("http://{addr}"),
+        );
+        let (status, body) = request(app, "POST", "/api/v1/worker/freeze", "", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["frozen"], true);
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ test('normalize maps a worker snapshot including target totals', () => {
     interval_secs: 15,
     buffer: { samples: 10, cap: 20 },
     cold_files: 2,
+    queue: { frozen: true, paused: false, depth: 1 },
     targets: [
       {
         name: 'a',
@@ -33,11 +34,17 @@ test('normalize maps a worker snapshot including target totals', () => {
     ],
   });
   assert.equal(n.status, 'degraded');
+  assert.equal(n.frozen, true);
   assert.equal(n.bufferSamples, 10);
   assert.equal(n.coldFiles, 2);
   assert.equal(n.targets[0].lastStatus, 'fetch_error');
   assert.equal(n.targets[0].consecutiveFailures, 3);
   assert.equal(n.targets[0].totals.fetchError, 3);
+});
+
+test('normalize defaults frozen to false when absent', () => {
+  assert.equal(StatusClient.normalize({ status: 'ok' }).frozen, false);
+  assert.equal(StatusClient.normalize(null).frozen, false);
 });
 
 test('ageText rounds to human units', () => {
