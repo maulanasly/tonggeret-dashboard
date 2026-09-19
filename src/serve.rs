@@ -25,29 +25,45 @@ use std::time::SystemTime;
 
 use axum::extract::{Path as UrlPath, Query as UrlQuery, Request, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{any, delete, get, post};
+use serde::Deserialize;
 use tower::ServiceExt as _;
 
 use crate::query::{self, QueryError, RecentBuffer};
-use crate::status::{StatusSnapshot, StatusTracker};
+use crate::queue::{JobQueue, QueueError, QueueSummary};
+use crate::status::{QueueInfo, StatusSnapshot, StatusTracker};
+use crate::targets::{Mode, Target, TargetError, TargetRegistry};
 
 /// Cold export filename shape (`tonggeret::storage` convention).
 const COLD_PREFIX: &str = "metrics_cold_";
 
-/// Worker router: hot APIs, `/metrics`, cold surface, status contract.
+/// Worker router: hot APIs, `/metrics`, cold surface, status contract, and
+/// the mutating control API (`/api/v1/targets`, `/api/v1/queue`).
 ///
-/// `tracker` is updated on the scrape path; this router only reads it.
+/// `tracker` / `registry` / `queue` are updated by the executor; this router
+/// reads and mutates them. `control_token`, when set, is required on every
+/// mutating endpoint via the `x-control-token` header.
 pub fn worker_router(
     cold_dir: PathBuf,
     buffer: Arc<RecentBuffer>,
     tracker: Arc<StatusTracker>,
+    registry: Arc<TargetRegistry>,
+    queue: Arc<JobQueue>,
+    control_token: Option<String>,
 ) -> axum::Router {
     let status_ctx = StatusCtx {
         tracker,
         buffer: buffer.clone(),
         cold_dir: Arc::new(cold_dir.clone()),
+        queue: queue.clone(),
+    };
+    let ctrl = ControlCtx {
+        registry,
+        queue,
+        tracker: status_ctx.tracker.clone(),
+        token: control_token.map(Arc::new),
     };
     axum::Router::new()
         .route("/api/files", files_route(cold_dir.clone()))
@@ -60,6 +76,40 @@ pub fn worker_router(
             "/api/v1/status",
             get(collector_status).with_state(status_ctx),
         )
+        // Control API: targets.
+        .route(
+            "/api/v1/targets",
+            get(list_targets).post(add_targets).with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/targets/{id}/enable",
+            post(enable_target).with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/targets/{id}/disable",
+            post(disable_target).with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/targets/{id}",
+            delete(remove_target).with_state(ctrl.clone()),
+        )
+        // Control API: queue (pause/resume before the `{id}` wildcard).
+        .route(
+            "/api/v1/queue",
+            get(queue_status)
+                .post(enqueue_jobs)
+                .delete(clear_queue)
+                .with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/queue/pause",
+            post(pause_queue).with_state(ctrl.clone()),
+        )
+        .route(
+            "/api/v1/queue/resume",
+            post(resume_queue).with_state(ctrl.clone()),
+        )
+        .route("/api/v1/queue/{id}", delete(cancel_job).with_state(ctrl))
         .route(
             "/telemetry/cold/{file}",
             get(serve_cold_file).with_state(Arc::new(cold_dir.clone())),
@@ -73,8 +123,9 @@ pub fn worker_router(
 }
 
 /// Read-only dashboard router: `dist/` + local cold files, hot API/status
-/// reverse-proxied to `upstream`. Never opens Fjall. Serves the cold surface
-/// locally so history keeps working while the worker is unreachable.
+/// and the control API reverse-proxied to `upstream`. Never opens Fjall.
+/// Serves the cold surface locally so history keeps working while the worker
+/// is unreachable.
 pub fn dashboard_router(static_dir: PathBuf, cold_dir: PathBuf, upstream: &str) -> axum::Router {
     let proxy = ProxyCtx {
         client: reqwest::Client::new(),
@@ -90,7 +141,27 @@ pub fn dashboard_router(static_dir: PathBuf, cold_dir: PathBuf, upstream: &str) 
             "/api/v1/labels",
             get(proxy_upstream).with_state(proxy.clone()),
         )
-        .route("/api/v1/status", get(dashboard_status).with_state(proxy))
+        .route(
+            "/api/v1/status",
+            get(dashboard_status).with_state(proxy.clone()),
+        )
+        // Control API proxies: method/body/token forwarded to the worker.
+        .route(
+            "/api/v1/targets",
+            any(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route(
+            "/api/v1/targets/{*rest}",
+            any(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route(
+            "/api/v1/queue",
+            any(proxy_upstream).with_state(proxy.clone()),
+        )
+        .route(
+            "/api/v1/queue/{*rest}",
+            any(proxy_upstream).with_state(proxy),
+        )
         .route(
             "/telemetry/cold/{file}",
             get(serve_cold_file).with_state(Arc::new(cold_dir.clone())),
@@ -120,13 +191,290 @@ struct StatusCtx {
     tracker: Arc<StatusTracker>,
     buffer: Arc<RecentBuffer>,
     cold_dir: Arc<PathBuf>,
+    queue: Arc<JobQueue>,
 }
 
 /// `GET /api/v1/status` — worker health snapshot (see [`crate::status`]).
 async fn collector_status(State(ctx): State<StatusCtx>) -> Json<StatusSnapshot> {
     let (samples, cap) = ctx.buffer.occupancy();
     let cold_files = list_cold_files(ctx.cold_dir.as_path()).len();
-    Json(ctx.tracker.snapshot(samples, cap, cold_files))
+    let q = ctx.queue.snapshot();
+    Json(ctx.tracker.snapshot(
+        samples,
+        cap,
+        cold_files,
+        QueueInfo {
+            depth: q.depth,
+            cap: q.cap,
+            paused: q.paused,
+            running: q.running.map(|j| j.target),
+            done: q.done,
+            failed: q.failed,
+        },
+    ))
+}
+
+/// Shared state for the mutating control API.
+#[derive(Clone)]
+struct ControlCtx {
+    registry: Arc<TargetRegistry>,
+    queue: Arc<JobQueue>,
+    tracker: Arc<StatusTracker>,
+    token: Option<Arc<String>>,
+}
+
+/// Control-API failures → `{"detail": ...}` with a matching status code.
+#[derive(Debug)]
+enum ApiError {
+    /// 422: malformed/duplicate input.
+    Invalid(String),
+    /// 404: unknown target/job.
+    NotFound(String),
+    /// 429: a bounded resource is full.
+    Full(String),
+    /// 401: control token missing/wrong.
+    Unauthorized,
+    /// 500: persistence/other internal failure.
+    Internal(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, detail) = match self {
+            ApiError::Invalid(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Full(m) => (StatusCode::TOO_MANY_REQUESTS, m),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid x-control-token".to_string(),
+            ),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        };
+        (status, Json(serde_json::json!({ "detail": detail }))).into_response()
+    }
+}
+
+impl From<TargetError> for ApiError {
+    fn from(e: TargetError) -> Self {
+        match e {
+            TargetError::Invalid(m) => Self::Invalid(m),
+            TargetError::NotFound(m) => Self::NotFound(m),
+            TargetError::Limit(m) => Self::Full(m),
+            TargetError::Persist(m) => Self::Internal(m),
+        }
+    }
+}
+
+impl From<QueueError> for ApiError {
+    fn from(e: QueueError) -> Self {
+        match e {
+            QueueError::Full(_) => Self::Full(e.to_string()),
+            QueueError::NotFound(m) => Self::NotFound(m),
+        }
+    }
+}
+
+/// Enforce the optional control token on mutating endpoints.
+fn authorize(ctx: &ControlCtx, headers: &HeaderMap) -> Result<(), ApiError> {
+    match &ctx.token {
+        None => Ok(()),
+        Some(expected) => {
+            let got = headers.get("x-control-token").and_then(|v| v.to_str().ok());
+            if got.is_some_and(|g| g == expected.as_str()) {
+                Ok(())
+            } else {
+                Err(ApiError::Unauthorized)
+            }
+        }
+    }
+}
+
+/// `POST /api/v1/targets` body. `urls` (or `url`) is required; empty `allow`
+/// uses the default prefixes; `mode` defaults to recurring.
+#[derive(Debug, Deserialize)]
+struct AddTargetsRequest {
+    /// One or more `/metrics` URLs.
+    #[serde(default)]
+    urls: Vec<String>,
+    /// Single-URL convenience alias.
+    #[serde(default)]
+    url: Option<String>,
+    /// Optional explicit name (only valid for a single URL).
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional allow prefixes (defaults when empty/absent).
+    #[serde(default)]
+    allow: Option<Vec<String>>,
+    /// `recurring` (swept) or `once` (queued immediately).
+    #[serde(default)]
+    mode: Mode,
+}
+
+/// `POST /api/v1/queue` body.
+#[derive(Debug, Deserialize)]
+struct EnqueueRequest {
+    /// URLs to enqueue as one-shot manual jobs (targets auto-created).
+    #[serde(default)]
+    urls: Vec<String>,
+}
+
+/// `GET /api/v1/targets` — registry contents.
+async fn list_targets(State(ctx): State<ControlCtx>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "targets": ctx.registry.list() }))
+}
+
+/// `POST /api/v1/targets` — add one or more dynamic targets; `once` targets
+/// are also enqueued as manual jobs.
+async fn add_targets(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+    Json(req): Json<AddTargetsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&ctx, &headers)?;
+    let mut urls = req.urls;
+    if let Some(u) = req.url {
+        urls.push(u);
+    }
+    urls.retain(|u| !u.trim().is_empty());
+    if urls.is_empty() {
+        return Err(ApiError::Invalid("urls must not be empty".to_string()));
+    }
+    if urls.len() > 1 && req.name.is_some() {
+        return Err(ApiError::Invalid(
+            "name is only valid with a single url".to_string(),
+        ));
+    }
+
+    let mut created = Vec::new();
+    let mut jobs = Vec::new();
+    for url in urls {
+        let target =
+            ctx.registry
+                .add_dynamic(req.name.as_deref(), &url, req.allow.as_deref(), req.mode)?;
+        ctx.tracker.add_target(&target);
+        if req.mode == Mode::Once {
+            jobs.push(
+                ctx.queue
+                    .enqueue_manual(&target.name, &target.url, target.allow.clone())?,
+            );
+        }
+        created.push(target);
+    }
+    Ok(Json(
+        serde_json::json!({ "targets": created, "jobs": jobs }),
+    ))
+}
+
+/// `POST /api/v1/targets/{id}/enable`.
+async fn enable_target(
+    State(ctx): State<ControlCtx>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Target>, ApiError> {
+    authorize(&ctx, &headers)?;
+    let target = ctx.registry.set_enabled(&id, true)?;
+    ctx.tracker.set_enabled(&id, true);
+    Ok(Json(target))
+}
+
+/// `POST /api/v1/targets/{id}/disable`.
+async fn disable_target(
+    State(ctx): State<ControlCtx>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Target>, ApiError> {
+    authorize(&ctx, &headers)?;
+    let target = ctx.registry.set_enabled(&id, false)?;
+    ctx.tracker.set_enabled(&id, false);
+    Ok(Json(target))
+}
+
+/// `DELETE /api/v1/targets/{id}`.
+async fn remove_target(
+    State(ctx): State<ControlCtx>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Target>, ApiError> {
+    authorize(&ctx, &headers)?;
+    let target = ctx.registry.remove(&id)?;
+    ctx.tracker.remove_target(&id);
+    Ok(Json(target))
+}
+
+/// `GET /api/v1/queue` — queue state for the UI.
+async fn queue_status(State(ctx): State<ControlCtx>) -> Json<QueueSummary> {
+    Json(ctx.queue.snapshot())
+}
+
+/// `POST /api/v1/queue` — enqueue one-shot manual jobs (targets auto-created).
+async fn enqueue_jobs(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+    Json(req): Json<EnqueueRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&ctx, &headers)?;
+    let mut jobs = Vec::new();
+    for url in req.urls {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let target = if let Some(t) = ctx.registry.find_by_url(url) {
+            t
+        } else {
+            let t = ctx.registry.add_dynamic(None, url, None, Mode::Once)?;
+            ctx.tracker.add_target(&t);
+            t
+        };
+        jobs.push(
+            ctx.queue
+                .enqueue_manual(&target.name, &target.url, target.allow.clone())?,
+        );
+    }
+    if jobs.is_empty() {
+        return Err(ApiError::Invalid("urls must not be empty".to_string()));
+    }
+    Ok(Json(serde_json::json!({ "jobs": jobs })))
+}
+
+/// `POST /api/v1/queue/pause` — hold manual jobs (scheduled keep running).
+async fn pause_queue(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+) -> Result<Json<QueueSummary>, ApiError> {
+    authorize(&ctx, &headers)?;
+    ctx.queue.pause();
+    Ok(Json(ctx.queue.snapshot()))
+}
+
+/// `POST /api/v1/queue/resume` — release manual jobs.
+async fn resume_queue(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+) -> Result<Json<QueueSummary>, ApiError> {
+    authorize(&ctx, &headers)?;
+    ctx.queue.resume();
+    Ok(Json(ctx.queue.snapshot()))
+}
+
+/// `DELETE /api/v1/queue/{id}` — cancel one pending job.
+async fn cancel_job(
+    State(ctx): State<ControlCtx>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<crate::queue::Job>, ApiError> {
+    authorize(&ctx, &headers)?;
+    Ok(Json(ctx.queue.cancel(&id)?))
+}
+
+/// `DELETE /api/v1/queue` — drop every pending job.
+async fn clear_queue(
+    State(ctx): State<ControlCtx>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&ctx, &headers)?;
+    let cancelled = ctx.queue.clear_pending();
+    Ok(Json(serde_json::json!({ "cancelled": cancelled })))
 }
 
 /// Dashboard proxy state: HTTP client + worker base URL.
@@ -136,13 +484,30 @@ struct ProxyCtx {
     upstream: Arc<String>,
 }
 
-/// Reverse-proxy `query_range` / `labels` to the worker. On any upstream
-/// failure the dashboard answers 503 (Prometheus-shaped error body) instead
-/// of hanging — the UI then falls back to cold Parquet.
+/// Reverse-proxy a request to the worker, forwarding method, query, body,
+/// content-type, and the `x-control-token` header. Used for the GET hot
+/// APIs and the mutating control API. On any upstream failure the dashboard
+/// answers 503 (Prometheus-shaped error body) instead of hanging.
 async fn proxy_upstream(State(ctx): State<ProxyCtx>, req: Request) -> Response {
+    let method = req.method().clone();
     let path_query = req.uri().path_and_query().map_or("", |p| p.as_str());
     let url = format!("{}{}", ctx.upstream, path_query);
-    match ctx.client.get(&url).send().await {
+
+    let mut builder = ctx.client.request(method, &url);
+    if let Some(ct) = req.headers().get(CONTENT_TYPE) {
+        builder = builder.header(CONTENT_TYPE, ct);
+    }
+    if let Some(token) = req.headers().get("x-control-token") {
+        builder = builder.header("x-control-token", token);
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return gateway_error(&format!("request body too large: {e}")),
+    };
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+    match builder.send().await {
         Ok(resp) if resp.status().is_success() => passthrough(resp).await,
         Ok(resp) => gateway_error(&format!("upstream returned {}", resp.status())),
         Err(e) => gateway_error(&format!("collector offline: {e}")),
@@ -387,9 +752,30 @@ mod tests {
     use crate::config::TargetConfig;
     use crate::query::{BufferedSample, RecentBuffer};
     use crate::scrape::ScrapeStatus;
+    use crate::targets::{Mode, Origin, Target};
+
+    fn targets_for(names: &[&str]) -> Vec<Target> {
+        names
+            .iter()
+            .map(|n| Target {
+                id: format!("cfg:{n}"),
+                name: (*n).to_string(),
+                url: format!("http://localhost/{n}/metrics"),
+                allow: vec!["http_".to_string()],
+                enabled: true,
+                origin: Origin::Config,
+                mode: Mode::Recurring,
+                created_at: 0,
+            })
+            .collect()
+    }
 
     fn tracker_for(names: &[&str]) -> Arc<StatusTracker> {
-        let targets: Vec<TargetConfig> = names
+        Arc::new(StatusTracker::new(&targets_for(names), 15, 30))
+    }
+
+    fn registry_for(dir: &Path, names: &[&str]) -> Arc<TargetRegistry> {
+        let cfg: Vec<TargetConfig> = names
             .iter()
             .map(|n| TargetConfig {
                 name: (*n).to_string(),
@@ -397,7 +783,7 @@ mod tests {
                 allow: vec!["http_".to_string()],
             })
             .collect();
-        Arc::new(StatusTracker::new(&targets, 15, 30))
+        Arc::new(TargetRegistry::load(&cfg, &dir.join("targets.json"), 64).unwrap())
     }
 
     fn seeded_buffer() -> Arc<RecentBuffer> {
@@ -415,13 +801,29 @@ mod tests {
     }
 
     fn worker_app(cold: &Path, buffer: Arc<RecentBuffer>) -> axum::Router {
-        super::worker_router(cold.to_path_buf(), buffer, tracker_for(&["app"]))
+        super::worker_router(
+            cold.to_path_buf(),
+            buffer,
+            tracker_for(&["app"]),
+            registry_for(cold, &["app"]),
+            Arc::new(JobQueue::new(16)),
+            None,
+        )
     }
 
-    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
-        let request = axum::http::Request::builder()
-            .uri(uri)
-            .body(axum::body::Body::empty())
+    async fn request(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = axum::http::Request::builder().uri(uri).method(method);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let request = builder
+            .body(axum::body::Body::from(body.to_string()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
@@ -429,6 +831,10 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        request(app, "GET", uri, "", &[]).await
     }
 
     #[tokio::test]
@@ -480,7 +886,14 @@ mod tests {
         let tracker = tracker_for(&["app"]);
         tracker.record("app", ScrapeStatus::Ok, 3, 9);
 
-        let app = super::worker_router(dir.path().to_path_buf(), seeded_buffer(), tracker);
+        let app = super::worker_router(
+            dir.path().to_path_buf(),
+            seeded_buffer(),
+            tracker,
+            registry_for(dir.path(), &["app"]),
+            Arc::new(JobQueue::new(16)),
+            None,
+        );
         let (status, body) = get(app, "/api/v1/status").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ok");
@@ -567,5 +980,227 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "error");
+    }
+
+    fn control_app(
+        dir: &Path,
+        registry: Arc<TargetRegistry>,
+        tracker: Arc<StatusTracker>,
+        queue: Arc<JobQueue>,
+        token: Option<String>,
+    ) -> axum::Router {
+        super::worker_router(
+            dir.to_path_buf(),
+            seeded_buffer(),
+            tracker,
+            registry,
+            queue,
+            token,
+        )
+    }
+
+    #[tokio::test]
+    async fn control_api_adds_targets_and_enqueues_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let tracker = tracker_for(&["app"]);
+        let queue = Arc::new(JobQueue::new(16));
+        let app = control_app(dir.path(), registry.clone(), tracker, queue.clone(), None);
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/v1/targets",
+            r#"{"urls":["https://a.example/metrics"],"mode":"recurring"}"#,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["targets"][0]["mode"], "recurring");
+        assert_eq!(body["targets"][0]["enabled"], true);
+        assert_eq!(registry.list().len(), 2);
+        assert!(dir.path().join("targets.json").exists());
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/v1/targets",
+            r#"{"urls":["https://b.example/metrics"],"mode":"once"}"#,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(queue.snapshot().depth, 1);
+        assert_eq!(registry.list().len(), 3);
+
+        let (status, body) = get(app, "/api/v1/targets").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["targets"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn control_api_pause_cancel_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let tracker = tracker_for(&["app"]);
+        let queue = Arc::new(JobQueue::new(16));
+        let app = control_app(dir.path(), registry, tracker, queue.clone(), None);
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/v1/queue",
+            r#"{"urls":["https://c.example/metrics"]}"#,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+
+        let (status, body) = request(app.clone(), "POST", "/api/v1/queue/pause", "", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["paused"], true);
+
+        let (status, body) = get(app.clone(), "/api/v1/queue").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["paused"], true);
+        assert_eq!(body["depth"], 1);
+        let id = body["pending"][0]["id"].as_str().unwrap().to_string();
+
+        let (status, _) = request(
+            app.clone(),
+            "DELETE",
+            &format!("/api/v1/queue/{id}"),
+            "",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(queue.snapshot().depth, 0);
+
+        let (status, body) = request(app, "POST", "/api/v1/queue/resume", "", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["paused"], false);
+    }
+
+    #[tokio::test]
+    async fn control_api_validates_and_maps_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let tracker = tracker_for(&["app"]);
+        let queue = Arc::new(JobQueue::new(1));
+        let app = control_app(dir.path(), registry, tracker, queue, None);
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/v1/targets",
+            r#"{"urls":["ftp://nope"]}"#,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["detail"].as_str().unwrap().contains("http"));
+
+        let (status, _) = request(app.clone(), "DELETE", "/api/v1/targets/cfg:app", "", &[]).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = request(app.clone(), "DELETE", "/api/v1/targets/nope", "", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Fill the size-1 queue, then overflow → 429.
+        let body = r#"{"urls":["https://q1.example/metrics"]}"#;
+        let _ = request(
+            app.clone(),
+            "POST",
+            "/api/v1/queue",
+            body,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        let (status, _) = request(
+            app,
+            "POST",
+            "/api/v1/queue",
+            r#"{"urls":["https://q2.example/metrics"]}"#,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn control_token_is_enforced_on_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let tracker = tracker_for(&["app"]);
+        let queue = Arc::new(JobQueue::new(16));
+        let app = control_app(dir.path(), registry, tracker, queue, Some("s3cret".into()));
+
+        let (status, body) = request(app.clone(), "POST", "/api/v1/queue/pause", "", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body["detail"].as_str().unwrap().contains("token"));
+
+        let (status, _) = request(
+            app.clone(),
+            "POST",
+            "/api/v1/queue/pause",
+            "",
+            &[("x-control-token", "s3cret")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Reads stay open.
+        let (status, _) = get(app, "/api/v1/queue").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_proxies_control_method_body_and_token() {
+        async fn echo(req: Request) -> Json<serde_json::Value> {
+            let method = req.method().to_string();
+            let token = req
+                .headers()
+                .get("x-control-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = axum::body::to_bytes(req.into_body(), 4096).await.unwrap();
+            Json(serde_json::json!({
+                "method": method,
+                "token": token,
+                "body": String::from_utf8_lossy(&bytes),
+            }))
+        }
+        let upstream = axum::Router::new().route("/api/v1/targets", axum::routing::any(echo));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = super::dashboard_router(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            &format!("http://{addr}"),
+        );
+        let (status, body) = request(
+            app,
+            "POST",
+            "/api/v1/targets",
+            r#"{"urls":["https://x.example/metrics"]}"#,
+            &[
+                ("content-type", "application/json"),
+                ("x-control-token", "tok"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["method"], "POST");
+        assert_eq!(body["token"], "tok");
+        assert!(body["body"].as_str().unwrap().contains("urls"));
     }
 }

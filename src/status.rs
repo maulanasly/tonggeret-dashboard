@@ -3,20 +3,22 @@
 //! The worker updates per-target state inline on the scrape path; the
 //! dashboard polls this endpoint to show collector health without parsing
 //! `/metrics` text. State is plain shared memory (`Mutex<Vec<TargetStatus>>`,
-//! one entry per configured target) — no new background task, consistent
+//! one entry per registered target) — no new background task, consistent
 //! with the `AGENTS.md` memory-budget rule.
 //!
 //! `last_*` / `consecutive_failures` extend the aggregate
 //! `collector_scrape_total{target,status}` counter with per-target recency,
-//! which the Prometheus registry cannot express.
+//! which the Prometheus registry cannot express. The registry (`crate::targets`)
+//! calls `add_target` / `set_enabled` / `remove_target` to keep entries in
+//! sync when targets change at runtime.
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::config::TargetConfig;
 use crate::scrape::ScrapeStatus;
+use crate::targets::{Mode, Origin, Target};
 
 /// Overall collector health: all targets healthy.
 pub const STATUS_OK: &str = "ok";
@@ -42,6 +44,23 @@ pub struct BufferInfo {
     pub cap: usize,
 }
 
+/// Job-queue health for the status payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueInfo {
+    /// Pending job count.
+    pub depth: usize,
+    /// Queue capacity.
+    pub cap: usize,
+    /// True when manual jobs are held.
+    pub paused: bool,
+    /// Name of the currently running job's target, if any.
+    pub running: Option<String>,
+    /// Lifetime completed jobs.
+    pub done: u64,
+    /// Lifetime failed jobs.
+    pub failed: u64,
+}
+
 /// Per-status scrape totals (mirrors `collector_scrape_total{status}`).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScrapeTotals {
@@ -56,10 +75,18 @@ pub struct ScrapeTotals {
 /// One target's status.
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetStatus {
+    /// Target id (registry key).
+    pub id: String,
     /// Target slug (`scrape_target` label).
     pub name: String,
     /// `/metrics` URL.
     pub url: String,
+    /// Config or dynamic.
+    pub origin: Origin,
+    /// Recurring or once.
+    pub mode: Mode,
+    /// Included in the periodic sweep.
+    pub enabled: bool,
     /// Unix seconds of the last attempt (`null` before the first scrape).
     pub last_scrape_ts: Option<u64>,
     /// Outcome of the last attempt (`ok` / `fetch_error` / `parse_error`).
@@ -89,15 +116,21 @@ pub struct StatusSnapshot {
     pub cold_files: usize,
     /// Hot age after which keys compact to Parquet.
     pub retention_days: u64,
-    /// One entry per configured target, in config order.
+    /// Job-queue health.
+    pub queue: QueueInfo,
+    /// One entry per registered target.
     pub targets: Vec<TargetStatus>,
 }
 
 impl TargetStatus {
-    fn new(target: &TargetConfig) -> Self {
+    fn new(target: &Target) -> Self {
         Self {
+            id: target.id.clone(),
             name: target.name.clone(),
             url: target.url.clone(),
+            origin: target.origin,
+            mode: target.mode,
+            enabled: target.enabled,
             last_scrape_ts: None,
             last_status: None,
             last_samples: 0,
@@ -108,8 +141,8 @@ impl TargetStatus {
     }
 }
 
-/// Process-global-ish status tracker shared by the scrape loop (writer) and
-/// the `/api/v1/status` handler (reader). Cheap `Arc`-clonable.
+/// Status tracker shared by the scrape loop (writer), the control API
+/// (target add/remove), and the `/api/v1/status` handler (reader).
 #[derive(Debug)]
 pub struct StatusTracker {
     interval_secs: u64,
@@ -119,9 +152,9 @@ pub struct StatusTracker {
 }
 
 impl StatusTracker {
-    /// Build a tracker with one entry per configured target, in config order.
+    /// Build a tracker with one entry per registered target.
     #[must_use]
-    pub fn new(targets: &[TargetConfig], interval_secs: u64, retention_days: u64) -> Self {
+    pub fn new(targets: &[Target], interval_secs: u64, retention_days: u64) -> Self {
         Self {
             interval_secs,
             retention_days,
@@ -131,8 +164,8 @@ impl StatusTracker {
     }
 
     /// Record one finished scrape attempt for `target`. Unknown names are
-    /// ignored (the target set is fixed by config). Never blocks the scrape
-    /// path for long: one short mutex hold, like the recent buffer.
+    /// ignored (a removed target may still finish in flight). Never blocks
+    /// the scrape path for long: one short mutex hold.
     pub fn record(&self, target: &str, status: ScrapeStatus, samples: usize, duration_ms: u64) {
         let Ok(mut targets) = self.targets.lock() else {
             return;
@@ -160,19 +193,47 @@ impl StatusTracker {
         }
     }
 
+    /// Add a newly registered target to the status list.
+    pub fn add_target(&self, target: &Target) {
+        if let Ok(mut targets) = self.targets.lock() {
+            if !targets.iter().any(|t| t.id == target.id) {
+                targets.push(TargetStatus::new(target));
+            }
+        }
+    }
+
+    /// Reflect an enable/disable change.
+    pub fn set_enabled(&self, id: &str, enabled: bool) {
+        if let Ok(mut targets) = self.targets.lock() {
+            if let Some(entry) = targets.iter_mut().find(|t| t.id == id) {
+                entry.enabled = enabled;
+            }
+        }
+    }
+
+    /// Drop a removed target's status entry.
+    pub fn remove_target(&self, id: &str) {
+        if let Ok(mut targets) = self.targets.lock() {
+            targets.retain(|t| t.id != id);
+        }
+    }
+
     /// Snapshot with the worker-owned figures the scrape path cannot know
-    /// (buffer occupancy, cold-file count).
+    /// (buffer occupancy, cold-file count, queue health).
     #[must_use]
     pub fn snapshot(
         &self,
         buffer_samples: usize,
         buffer_cap: usize,
         cold_files: usize,
+        queue: QueueInfo,
     ) -> StatusSnapshot {
         let (targets, status) = match self.targets.lock() {
             Ok(t) => {
                 let any_failing = t.iter().any(|s| s.consecutive_failures > 0);
-                let any_unscraped = t.iter().any(|s| s.last_scrape_ts.is_none());
+                let any_unscraped = t
+                    .iter()
+                    .any(|s| s.enabled && s.mode == Mode::Recurring && s.last_scrape_ts.is_none());
                 let status = if any_failing {
                     STATUS_DEGRADED
                 } else if any_unscraped {
@@ -194,6 +255,7 @@ impl StatusTracker {
             },
             cold_files,
             retention_days: self.retention_days,
+            queue,
             targets,
         }
     }
@@ -203,31 +265,43 @@ impl StatusTracker {
 mod tests {
     use super::*;
 
-    fn targets() -> Vec<TargetConfig> {
-        vec![
-            TargetConfig {
-                name: "a".to_string(),
-                url: "http://localhost:1/metrics".to_string(),
-                allow: vec!["http_".to_string()],
-            },
-            TargetConfig {
-                name: "b".to_string(),
-                url: "http://localhost:2/metrics".to_string(),
-                allow: vec!["http_".to_string()],
-            },
-        ]
+    fn target(id: &str, name: &str, mode: Mode) -> Target {
+        Target {
+            id: id.to_string(),
+            name: name.to_string(),
+            url: format!("http://localhost/{name}/metrics"),
+            allow: vec!["http_".to_string()],
+            enabled: mode == Mode::Recurring,
+            origin: Origin::Dynamic,
+            mode,
+            created_at: 0,
+        }
+    }
+
+    fn queue_info() -> QueueInfo {
+        QueueInfo {
+            depth: 0,
+            cap: 256,
+            paused: false,
+            running: None,
+            done: 0,
+            failed: 0,
+        }
     }
 
     #[test]
     fn starts_as_starting_then_ok() {
-        let t = StatusTracker::new(&targets(), 15, 30);
-        let snap = t.snapshot(0, 20_000, 0);
+        let targets = vec![
+            target("a", "a", Mode::Recurring),
+            target("b", "b", Mode::Recurring),
+        ];
+        let t = StatusTracker::new(&targets, 15, 30);
+        let snap = t.snapshot(0, 20_000, 0, queue_info());
         assert_eq!(snap.status, STATUS_STARTING);
         assert_eq!(snap.targets.len(), 2);
-        assert!(snap.targets[0].last_scrape_ts.is_none());
 
         t.record("a", ScrapeStatus::Ok, 5, 12);
-        let snap = t.snapshot(5, 20_000, 1);
+        let snap = t.snapshot(5, 20_000, 1, queue_info());
         assert_eq!(snap.status, STATUS_STARTING, "b still unscraped");
         assert_eq!(snap.targets[0].last_status.as_deref(), Some("ok"));
         assert_eq!(snap.targets[0].last_samples, 5);
@@ -236,26 +310,48 @@ mod tests {
         assert_eq!(snap.cold_files, 1);
 
         t.record("b", ScrapeStatus::Ok, 3, 7);
-        assert_eq!(t.snapshot(0, 1, 0).status, STATUS_OK);
+        assert_eq!(t.snapshot(0, 1, 0, queue_info()).status, STATUS_OK);
+    }
+
+    #[test]
+    fn once_targets_do_not_block_starting() {
+        let targets = vec![
+            target("a", "a", Mode::Recurring),
+            target("o", "one", Mode::Once),
+        ];
+        let t = StatusTracker::new(&targets, 15, 30);
+        t.record("a", ScrapeStatus::Ok, 1, 1);
+        assert_eq!(
+            t.snapshot(0, 1, 0, queue_info()).status,
+            STATUS_OK,
+            "unscraped once targets are not part of the sweep"
+        );
     }
 
     #[test]
     fn failures_degrade_and_streaks_reset_on_success() {
-        let t = StatusTracker::new(&targets(), 15, 30);
+        let targets = vec![
+            target("a", "a", Mode::Recurring),
+            target("b", "b", Mode::Recurring),
+        ];
+        let t = StatusTracker::new(&targets, 15, 30);
         t.record("a", ScrapeStatus::Ok, 1, 1);
         t.record("b", ScrapeStatus::Ok, 1, 1);
 
         t.record("a", ScrapeStatus::FetchError, 0, 5);
-        let snap = t.snapshot(0, 1, 0);
+        let snap = t.snapshot(0, 1, 0, queue_info());
         assert_eq!(snap.status, STATUS_DEGRADED);
         assert_eq!(snap.targets[0].consecutive_failures, 1);
         assert_eq!(snap.targets[0].totals.fetch_error, 1);
 
         t.record("a", ScrapeStatus::ParseError, 0, 5);
-        assert_eq!(t.snapshot(0, 1, 0).targets[0].consecutive_failures, 2);
+        assert_eq!(
+            t.snapshot(0, 1, 0, queue_info()).targets[0].consecutive_failures,
+            2
+        );
 
         t.record("a", ScrapeStatus::Ok, 2, 5);
-        let snap = t.snapshot(0, 1, 0);
+        let snap = t.snapshot(0, 1, 0, queue_info());
         assert_eq!(snap.status, STATUS_OK);
         assert_eq!(snap.targets[0].consecutive_failures, 0);
         assert_eq!(snap.targets[0].totals.ok, 2);
@@ -264,9 +360,23 @@ mod tests {
 
     #[test]
     fn unknown_target_is_ignored() {
-        let t = StatusTracker::new(&targets(), 15, 30);
+        let targets = vec![target("a", "a", Mode::Recurring)];
+        let t = StatusTracker::new(&targets, 15, 30);
         t.record("nope", ScrapeStatus::Ok, 1, 1);
-        let snap = t.snapshot(0, 1, 0);
+        let snap = t.snapshot(0, 1, 0, queue_info());
         assert!(snap.targets.iter().all(|s| s.last_scrape_ts.is_none()));
+    }
+
+    #[test]
+    fn runtime_add_enable_remove() {
+        let targets = vec![target("a", "a", Mode::Recurring)];
+        let t = StatusTracker::new(&targets, 15, 30);
+        let b = target("b", "b", Mode::Recurring);
+        t.add_target(&b);
+        assert_eq!(t.snapshot(0, 1, 0, queue_info()).targets.len(), 2);
+        t.set_enabled("b", false);
+        assert!(!t.snapshot(0, 1, 0, queue_info()).targets[1].enabled);
+        t.remove_target("b");
+        assert_eq!(t.snapshot(0, 1, 0, queue_info()).targets.len(), 1);
     }
 }

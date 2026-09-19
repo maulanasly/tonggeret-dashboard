@@ -43,7 +43,20 @@ pub struct PlannedSample {
     pub labels: Vec<(String, String)>,
 }
 
-/// Outcome of one target scrape (feeds `collector_*` self series).
+/// Outcome of one scrape cycle (feeds the job queue + status tracker).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrapeOutcome {
+    /// Success / fetch error / parse error.
+    pub status: ScrapeStatus,
+    /// Samples stored (0 on failure).
+    pub samples: usize,
+    /// Over-cap samples dropped.
+    pub dropped: usize,
+    /// Wall time, milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Scrape result classification (feeds `collector_scrape_total{status}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrapeStatus {
     /// Fetched, parsed, stored.
@@ -170,10 +183,11 @@ pub async fn scrape_once(
     max_body: usize,
     buffer: &RecentBuffer,
     tracker: &StatusTracker,
-) -> ScrapeStatus {
+) -> ScrapeOutcome {
     let now = now_micros();
     let start = std::time::Instant::now();
     let mut samples = 0_usize;
+    let mut dropped = 0_usize;
     let status = match fetch_body(client, &target.url, max_body).await {
         Err(e) => {
             tracing::warn!(target = %target.name, error = %e, "scrape fetch failed");
@@ -185,9 +199,10 @@ pub async fn scrape_once(
                 ScrapeStatus::ParseError
             }
             Ok(scrape) => {
-                let (planned, dropped) =
+                let (planned, over_cap) =
                     plan_samples(&target.name, &scrape, &target.allow, max_samples);
                 samples = planned.len();
+                dropped = over_cap;
                 store_samples(&planned);
                 buffer.push_batch(
                     &target.name,
@@ -201,11 +216,11 @@ pub async fn scrape_once(
                         })
                         .collect::<Vec<_>>(),
                 );
-                record_outcome(&target.name, planned.len(), dropped);
+                record_outcome(&target.name, planned.len(), over_cap);
                 tracing::debug!(
                     target = %target.name,
                     stored = planned.len(),
-                    dropped,
+                    dropped = over_cap,
                     "scrape stored"
                 );
                 ScrapeStatus::Ok
@@ -222,7 +237,12 @@ pub async fn scrape_once(
     #[allow(clippy::cast_possible_truncation)]
     let duration_ms = start.elapsed().as_millis() as u64;
     tracker.record(&target.name, status, samples, duration_ms);
-    status
+    ScrapeOutcome {
+        status,
+        samples,
+        dropped,
+        duration_ms,
+    }
 }
 
 fn record_outcome(target: &str, stored: usize, dropped: usize) {

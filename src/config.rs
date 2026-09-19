@@ -42,6 +42,26 @@ pub struct FjallSection {
     pub cold_purge_days: u64,
 }
 
+/// Runtime state: dynamically added targets.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StateSection {
+    /// JSON file persisting targets added through the control API.
+    #[serde(default = "default_targets_file")]
+    pub targets_file: PathBuf,
+    /// Cap on dynamically added targets (config targets are exempt).
+    #[serde(default = "default_max_dynamic_targets")]
+    pub max_dynamic_targets: usize,
+}
+
+impl Default for StateSection {
+    fn default() -> Self {
+        Self {
+            targets_file: default_targets_file(),
+            max_dynamic_targets: default_max_dynamic_targets(),
+        }
+    }
+}
+
 /// Top-level collector config.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
@@ -64,6 +84,13 @@ pub struct Config {
     /// Largest accepted exposition body in bytes.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Bounded job-queue capacity (manual + scheduled jobs).
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: usize,
+    /// Optional shared secret required on mutating control endpoints
+    /// (`x-control-token`); unset disables auth (`COLLECTOR_CONTROL_TOKEN`).
+    #[serde(default)]
+    pub control_token: Option<String>,
     /// Worker base URL used by `serve` to reverse-proxy the hot API and
     /// status (`COLLECTOR_UPSTREAM`). Ignored by `worker`.
     #[serde(default = "default_upstream")]
@@ -74,6 +101,9 @@ pub struct Config {
     /// Storage tuning.
     #[serde(default)]
     pub fjall: FjallSection,
+    /// Runtime state (dynamic targets).
+    #[serde(default)]
+    pub state: StateSection,
 }
 
 fn default_interval_secs() -> u64 {
@@ -102,6 +132,18 @@ fn default_max_body_bytes() -> usize {
 
 fn default_upstream() -> String {
     "http://127.0.0.1:8081".to_string()
+}
+
+fn default_queue_capacity() -> usize {
+    256
+}
+
+fn default_targets_file() -> PathBuf {
+    PathBuf::from("./data/targets.json")
+}
+
+fn default_max_dynamic_targets() -> usize {
+    64
 }
 
 fn default_fjall_dir() -> PathBuf {
@@ -138,7 +180,7 @@ impl Default for FjallSection {
 /// input with that prefix is denied before the allow check, so listing it
 /// here could never match.
 fn default_allow() -> Vec<String> {
-    ["http_", "beruang_", "tonggeret_", "visitors_", "unique_"]
+    crate::targets::DEFAULT_ALLOW_PREFIXES
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -185,6 +227,11 @@ pub fn load(path: &str) -> Result<Config, ConfigError> {
             cfg.upstream = upstream;
         }
     }
+    if let Ok(token) = std::env::var("COLLECTOR_CONTROL_TOKEN") {
+        if !token.trim().is_empty() {
+            cfg.control_token = Some(token);
+        }
+    }
     cfg.validate()?;
     Ok(cfg)
 }
@@ -211,6 +258,16 @@ impl Config {
         if self.max_body_bytes < 1024 {
             return Err(ConfigError::Invalid(
                 "max_body_bytes must be >= 1024".to_string(),
+            ));
+        }
+        if self.queue_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "queue_capacity must be > 0".to_string(),
+            ));
+        }
+        if self.state.max_dynamic_targets == 0 {
+            return Err(ConfigError::Invalid(
+                "state.max_dynamic_targets must be > 0".to_string(),
             ));
         }
         if !(self.upstream.trim().is_empty()
@@ -271,6 +328,10 @@ mod tests {
         assert_eq!(cfg.max_samples_per_scrape, 5_000);
         assert_eq!(cfg.recent_buffer_samples, 20_000);
         assert_eq!(cfg.upstream, "http://127.0.0.1:8081");
+        assert_eq!(cfg.queue_capacity, 256);
+        assert_eq!(cfg.state.max_dynamic_targets, 64);
+        assert_eq!(cfg.state.targets_file, PathBuf::from("./data/targets.json"));
+        assert!(cfg.control_token.is_none());
         assert_eq!(cfg.fjall.retention_days, 30);
         assert_eq!(cfg.fjall.cold_purge_days, 32);
         // Visitor prefixes ship in the default allowlist.
@@ -303,6 +364,14 @@ mod tests {
 
         let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
         cfg.upstream = "127.0.0.1:8081".to_string();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
+        cfg.queue_capacity = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
+        cfg.state.max_dynamic_targets = 0;
         assert!(cfg.validate().is_err());
     }
 

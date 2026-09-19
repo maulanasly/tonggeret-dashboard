@@ -24,25 +24,27 @@ Rust 1.85+ (collector) · Node 18+ (dashboard `npm run` scripts only) ·
 
 | Command | What |
 |---|---|
-| `cargo test` | unit (mapping/allowlist/config/serve/status/query incl. HTTP-level proxy + status) + e2e scrape→registry→Parquet |
+| `cargo test` | unit (mapping/allowlist/config/serve/status/targets/queue incl. HTTP-level control + proxy) + e2e scrape→registry→Parquet |
 | `cargo audit` | vulnerabilities fail; `paste`/`lexical-core` informationals allowed (upstream, see tonggeret repo) |
 | `npm run mock-server` | isolated UI dev without the collector |
 
 ## Structure
 
 ```
-src/main.rs      role dispatch (worker/serve) → worker: init (fatal) → scrape loop → serve ; serve: read-only UI/proxy
-src/config.rs    collector.toml + COLLECTOR_LISTEN / COLLECTOR_FJALL_DIR / COLLECTOR_UPSTREAM + validate()
+src/main.rs      role dispatch (worker/serve) → worker: init + unified executor (tick + queue) + serve
+src/config.rs    collector.toml + COLLECTOR_LISTEN / COLLECTOR_FJALL_DIR / COLLECTOR_UPSTREAM / COLLECTOR_CONTROL_TOKEN + validate()
 src/scrape.rs    fetch → prometheus-parse → allowlist/denylist → record_* + recent buffer + status ; outcome series
-src/serve.rs     worker_router (hot APIs + /metrics + cold + /api/v1/status) ; dashboard_router (dist/ + cold + proxy)
-src/status.rs    StatusTracker (per-target last scrape/status/streak) → GET /api/v1/status snapshot
+src/targets.rs   TargetRegistry: config + persisted dynamic targets (CRUD, dedupe, caps, atomic JSON)
+src/queue.rs     JobQueue: bounded, manual-first pop, pause (manual only), recent history
+src/serve.rs     worker_router (hot APIs + /metrics + cold + status + control API) ; dashboard_router (dist/ + cold + proxy)
+src/status.rs    StatusTracker (per-target last scrape/status/streak + runtime add/remove) → GET /api/v1/status
 src/query.rs     RecentBuffer (bounded, drop-oldest) + selector/step parsing + Prometheus matrix JSON
 tests/collector_flow.rs  mock /metrics → registry mirror → cold Parquet (short retention)
-index.html js/ css/      DuckDB-Wasm dashboard (display only, same-origin) + status panel
+index.html js/ css/      DuckDB-Wasm dashboard (display only) + status/targets panels
 deploy/          systemd units: tonggeret-collector.service + tonggeret-dashboard.service
 scripts/         mock-server (UI dev) + gen-mock-parquet (samples) + build-singlefile (dist/)
 collector.toml   example config (beruang :8000; uncomment example :3000)
-data/            LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history)
+data/            LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history) + data/targets.json (dynamic targets)
 ```
 
 ## Conventions
@@ -74,20 +76,31 @@ data/            LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history)
 - **Memory budget:** tonggeret defaults (8 MiB cache + 2 MiB memtable) +
   1 MiB body cap + 5k samples/scrape cap + sequential targets + one
   scraper task. No new background tasks without a budget note.
-  `StatusTracker` (one entry per target) and the status panel poll are
-  plain shared memory + a client timer — no new server task.
+  `StatusTracker` (one entry per target) and the status/targets panel polls
+  are plain shared memory + client timers. The **unified executor** is the
+  one task: interval tick + queue drain in the same task (no overlap), with
+  a bounded queue (`queue_capacity`, default 256) + 100-entry history.
+- **Dynamic targets + queue (load-bearing).** `TargetRegistry` mutates
+  runtime state and persists only dynamic targets to `state.targets_file`
+  atomically; config targets are immutable. `JobQueue::pop_next` is
+  **manual-first while running, scheduled-only while paused** — pause never
+  stops the recurring sweep. Control endpoints mutate state and require
+  `x-control-token` when `control_token`/`COLLECTOR_CONTROL_TOKEN` is set
+  (browser stores it, `serve` forwards it). Errors: 422 bad input, 429
+  queue/target cap, 404 unknown id.
+- **JS stays display-only for data** (SQL builders + rendering). The
+  Targets & queue panel (`js/targets_client.js`) is form wiring that calls
+  the proxied control API; the worker owns all state. No client-side math.
+- Single-binary `collector <config>` (worker, no role) stays supported.
+- **Cold storage:** `metrics_cold_*.parquet` only; purge horizon
+  (`cold_purge_days`) must exceed `retention_days`. `data/` never committed.
 - **Split-process roles (load-bearing).** `collector worker` is the only
   process that opens Fjall (the engine opens once/process, no read handles);
   `collector serve` must never be pointed at `data/fjall`. The only shared
   path is `data/cold` (worker writes, serve reads). `serve` reverse-proxies
-  `/api/v1/{query_range,labels,status}` and answers 503 (or 200 `offline`
-  for status) when the worker is down, so cold history always renders.
-  Single-binary `collector <config>` (worker, no role) stays supported.
-- **Cold storage:** `metrics_cold_*.parquet` only; purge horizon
-  (`cold_purge_days`) must exceed `retention_days`. `data/` never committed.
-- **JS stays display-only:** SQL builders + rendering; no math beyond
-  bucket/summary reshaping. No npm/CDN changes without noting the
-  zero-build + CSP posture.
+  the hot + control APIs and answers 503 (200 `offline` for status) when the
+  worker is down, so cold history always renders.
+- **No npm/CDN changes** without noting the zero-build + CSP posture.
   - **Vendored frontend deps (offline posture, 2026-09).** `vendor/`
     self-hosts DuckDB-Wasm (MVP-only: no COOP/COEP headers are sent, so
     `selectBundle` picks MVP anyway), Arrow ESM, ECharts, and Lucide

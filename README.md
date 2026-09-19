@@ -36,9 +36,11 @@ cargo run -- serve  collector.toml   # read-only UI; proxies the worker, serves 
 
 `collector.toml`: targets (`name`/`url`/`allow` prefixes), `interval_secs`,
 `listen`, `static_dir`, `upstream` (worker URL for `serve`),
-`max_samples_per_scrape`, `max_body_bytes`, `[fjall]` (`dir`, `cold_dir`,
-`retention_days = 30`, `cold_purge_days = 32`). Env overrides:
-`COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`, `COLLECTOR_UPSTREAM`.
+`max_samples_per_scrape`, `max_body_bytes`, `queue_capacity`,
+`control_token`, `[fjall]` (`dir`, `cold_dir`, `retention_days = 30`,
+`cold_purge_days = 32`), `[state]` (`targets_file`,
+`max_dynamic_targets = 64`). Env overrides: `COLLECTOR_LISTEN`,
+`COLLECTOR_FJALL_DIR`, `COLLECTOR_UPSTREAM`, `COLLECTOR_CONTROL_TOKEN`.
 Systemd units live in `deploy/`; see
 [`docs/architecture.md`](docs/architecture.md#split-process-deployment-worker--dashboard).
 
@@ -47,11 +49,22 @@ Systemd units live in `deploy/`; see
 | GET | `/` | prebuilt UI bundle (`dist/`) |
 | GET | `/metrics` | collector + mirrored scraped series (Prometheus text) |
 | GET | `/healthz` | liveness for both roles |
-| GET | `/api/v1/status` | worker health: uptime, buffer/cold counts, per-target last scrape/status/failure streak |
+| GET | `/api/v1/status` | worker health: uptime, buffer/cold counts, queue, per-target last scrape/status/failure streak |
 | GET | `/telemetry/parquet` | newest cold export (Range-capable) |
 | GET | `/telemetry/cold/:file` | named cold export, allowlisted to `metrics_cold_*.parquet` |
 | GET | `/api/files` | JSON manifest of cold files (auto-used by the UI) |
 | GET | `/api/v1/query_range` | Prometheus-shaped matrix JSON over recent samples (process lifetime) |
+| GET/POST | `/api/v1/targets` | list / add dynamic targets (`mode: recurring\|once`, multi-URL) |
+| POST | `/api/v1/targets/{id}/enable\|disable` | toggle a dynamic target |
+| DELETE | `/api/v1/targets/{id}` | remove a dynamic target |
+| GET/POST/DELETE | `/api/v1/queue` | queue snapshot / enqueue once jobs / clear pending |
+| POST | `/api/v1/queue/pause\|resume` | hold/release manual jobs (recurring keeps running) |
+| DELETE | `/api/v1/queue/{id}` | cancel one pending job |
+
+The dashboard **Targets & queue** panel drives these. Mutations run in a
+single worker executor (manual jobs first, one at a time); when
+`control_token` is set they require an `x-control-token` header. Errors:
+422 bad input · 429 queue/target cap · 404 unknown id · 401 bad token.
 
 `query_range` params: `query` (exact name or `{__name__="x",k="v"}` with
 `=` matchers only), `start`/`end` (unix seconds), `step` (seconds or
@@ -144,11 +157,14 @@ js/duckdb_worker.js         # WASM-in-Worker engine + hybrid range/fetch access
 js/duckdb_client.js         # source resolution, view lifecycle, summary math
 js/queries.js               # DOM-free SQL builders (Parquet contract)
 js/status_client.js         # /api/v1/status polling + collector health panel
+js/targets_client.js        # Targets & queue panel: control API + job queue
 js/charts.js                # ECharts renderers (dark theme, lttb sampling)
 js/components/cards.js      # summary cards
 js/components/controls.js   # range / source / custom-visualizer wiring
 js/app.js                   # boot + orchestration (main thread only renders)
 src/status.rs               # collector status snapshot (GET /api/v1/status)
+src/targets.rs              # runtime target registry (config + persisted dynamic)
+src/queue.rs                # bounded job queue + pause (executor state)
 deploy/                     # systemd units (worker + dashboard)
 scripts/mock-server.mjs     # npm run mock-server (static + CORS + Range + manifest)
 scripts/generate-mock-parquet.mjs  # npm run gen-mock (DuckDB-synthesized sample)

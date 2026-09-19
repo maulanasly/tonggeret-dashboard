@@ -1,11 +1,12 @@
 # tonggeret-dashboard collector config.
 #
 # Copy to your deploy dir and point `--config` at it. Env overrides:
-# `COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`, `COLLECTOR_UPSTREAM`.
+# `COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`, `COLLECTOR_UPSTREAM`,
+# `COLLECTOR_CONTROL_TOKEN`.
 #
 # Two roles share this file:
-#   collector worker collector.toml   # scrape + store + hot API + status
-#   collector serve  collector.toml   # read-only UI, proxies the worker
+#   collector worker collector.toml   # scrape + store + hot API + status + control
+#   collector serve  collector.toml   # read-only UI, proxies worker + control
 # `collector collector.toml` (no role) stays worker.
 
 # Seconds between scrape passes (targets scraped sequentially).
@@ -14,8 +15,8 @@ interval_secs = 15
 # In split-process mode set the worker to loopback and the dashboard public,
 # e.g. via COLLECTOR_LISTEN=127.0.0.1:8081 / 0.0.0.0:8080.
 listen = "0.0.0.0:8080"
-# Worker base URL used by the `serve` role to reverse-proxy the hot API and
-# `/api/v1/status`. Ignored by `worker`.
+# Worker base URL used by the `serve` role to reverse-proxy the hot API,
+# `/api/v1/status`, and the control API. Ignored by `worker`.
 upstream = "http://127.0.0.1:8081"
 # Prebuilt UI bundle served at `/`.
 static_dir = "dist"
@@ -26,6 +27,11 @@ max_samples_per_scrape = 5000
 recent_buffer_samples = 20000
 # Largest accepted exposition body in bytes.
 max_body_bytes = 1048576
+# Bounded job-queue capacity (manual + scheduled). Overflow is HTTP 429.
+queue_capacity = 256
+# Optional shared secret required on mutating control endpoints
+# (`x-control-token`). Unset = open on a trusted network.
+# control_token = "change-me"
 
 [fjall]
 dir = "./data/fjall"
@@ -34,6 +40,12 @@ cold_dir = "./data/cold"
 retention_days = 30
 # Cold files older than this are purged (must exceed retention_days).
 cold_purge_days = 32
+
+[state]
+# Dynamically added targets (control API) persist here; atomically rewritten.
+targets_file = "./data/targets.json"
+# Cap on dynamic targets (config targets are exempt).
+max_dynamic_targets = 64
 
 [[targets]]
 name = "beruang"

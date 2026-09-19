@@ -67,6 +67,18 @@ scrape targets (/metrics) ──15s──▶ collector ──store──▶ Fjal
 | GET | `/api/v1/query_range` | Prometheus matrix JSON over the hot buffer (proxied by `serve`) | worker |
 | GET | `/api/v1/labels` | distinct buffered metric names (proxied by `serve`) | worker |
 | GET | `/api/v1/status` | worker health snapshot (proxied by `serve`; 200 `offline` when down) | worker |
+| GET/POST | `/api/v1/targets` | list / add dynamic targets (`mode: recurring\|once`) | worker |
+| POST | `/api/v1/targets/{id}/enable\|disable` | toggle a dynamic target | worker |
+| DELETE | `/api/v1/targets/{id}` | remove a dynamic target | worker |
+| GET/POST/DELETE | `/api/v1/queue` | queue snapshot / enqueue once jobs / clear pending | worker |
+| POST | `/api/v1/queue/pause\|resume` | hold/release manual jobs | worker |
+| DELETE | `/api/v1/queue/{id}` | cancel one pending job | worker |
+
+Mutating control endpoints require `x-control-token` when
+`control_token` / `COLLECTOR_CONTROL_TOKEN` is set; the dashboard `serve`
+role proxies them (method + body + token) to the worker. Errors are
+`{"detail": ...}`: 422 bad input · 429 queue/target cap · 404 unknown id ·
+401 bad token.
 
 Both roles read the cold surface from the shared cold directory, so history
 keeps working when the worker is down; `serve` proxies only the hot APIs.
@@ -101,8 +113,10 @@ On Connect, the dashboard probes `<base>/api/v1/labels`:
   fallback). SQL builders live in `js/queries.js:43` (`throughputLatency:49`,
   `errorDistribution:65`, `visitorsByRegion:90`, `customSeries:110`);
   rendering in `js/charts.js:66`; summary cards in `js/components/cards.js:11`;
-  controls in `js/components/controls.js:11`. JS stays display-only: SQL
-  builders + rendering, no math beyond bucket/summary reshaping.
+  controls in `js/components/controls.js:11`. JS stays display-only for
+  data: SQL builders + rendering, no math beyond bucket/summary reshaping.
+  The Targets & queue panel (`js/targets_client.js`) is form wiring that
+  calls the proxied control API — the worker owns all state.
 
 Empty states are first-class: unknown apps yield zero visitor rows (preset
 shows its empty copy), fresh collectors 404 `/telemetry/parquet` until the
@@ -116,6 +130,8 @@ first compaction, and every chart has a `no … in range` state.
 | Body cap / samples cap | 1 MiB / 5k per scrape | `max_body_bytes`, `max_samples_per_scrape` |
 | Hot ring | 20k samples, drop-oldest | `recent_buffer_samples` |
 | Retention / cold purge | 30d / 32d | `[fjall]` |
+| Queue capacity / history | 256 pending / 100 recent | `queue_capacity`, `src/queue.rs` |
+| Dynamic target cap / state | 64 / `data/targets.json` | `[state]` |
 | Query caps | 7d range, 10k points, ≥1s step | `src/query.rs` consts |
 
 ## Walkthroughs
@@ -203,10 +219,15 @@ inline by `scrape::scrape_once` — plain shared memory, no new background task
   "buffer": { "samples": 1234, "cap": 20000 },
   "cold_files": 5,
   "retention_days": 30,
+  "queue": { "depth": 0, "cap": 256, "paused": false, "running": null, "done": 42, "failed": 1 },
   "targets": [
     {
+      "id": "cfg:beruang",
       "name": "beruang",
       "url": "http://localhost:8000/metrics",
+      "origin": "config",
+      "mode": "recurring",
+      "enabled": true,
       "last_scrape_ts": 1700000000,
       "last_status": "ok",
       "last_samples": 123,
@@ -220,10 +241,12 @@ inline by `scrape::scrape_once` — plain shared memory, no new background task
 
 `last_*` extends today's aggregate `collector_scrape_total{target,status}`
 counter with per-target recency, which the registry cannot express. The
-dashboard polls this (~`interval_secs`) and renders a status badge/panel:
-worker reachable, per-target last-scrape age and failure streaks, buffer
-occupancy, cold-file count. `status` is `degraded` when any target has a
-non-zero failure streak and `starting` before the first scrape.
+dashboard polls this (~15s) and renders a status badge/panel: worker
+reachable, per-target last-scrape age and failure streaks, buffer
+occupancy, cold-file count, and queue depth/pause. `status` is `degraded`
+when any target has a non-zero failure streak and `starting` while an
+enabled recurring target has not been scraped yet (once targets don't
+count).
 
 ### Storage ownership & invariants
 
@@ -283,6 +306,64 @@ Two units on one host, with nginx terminating TLS in front of the dashboard
 3. **Deploy**: `deploy/tonggeret-collector.service` +
    `deploy/tonggeret-dashboard.service`. Single-binary mode remains the
    default until the split is proven in production.
+
+## Dynamic targets + job queue (`src/targets.rs`, `src/queue.rs`)
+
+The dashboard's **Targets & queue** panel adds scrape URLs at runtime and
+controls when the worker picks them up. All state lives in the worker; the
+`serve` role proxies the control calls.
+
+### Target registry
+
+- `collector.toml` targets are `origin: config`, `mode: recurring`,
+  immutable.
+- Dynamically added targets are `origin: dynamic`, persisted to
+  `state.targets_file` (`data/targets.json`) with an atomic temp+rename on
+  every mutation, and reloaded at worker start. Cap:
+  `state.max_dynamic_targets` (default 64) → 429.
+- `mode: recurring` targets join the periodic sweep; `mode: once` targets
+  are created for the record but only run when enqueued.
+- URLs are http/https, deduped (exact, trimmed); names are unique
+  (`scrape_target`), auto-slugged from the host with a `-2` suffix on
+  collision.
+
+### Unified executor (one task)
+
+`src/main.rs` runs a single executor task. On each `interval_secs` tick it
+enqueues one `Scheduled` job per enabled recurring target (deduped so a slow
+target cannot pile up); the same task drains the queue, so scrapes never
+overlap:
+
+```text
+loop {
+  select! {
+    () = queue.notified() => {}
+    _  = tick.tick()      => enqueue_scheduled(),
+  }
+  while let Some(job) = queue.pop_next() { scrape(job).await; queue.complete(job, outcome) }
+}
+```
+
+`pop_next` returns the oldest **Manual** job while running, and only
+**Scheduled** jobs while paused — the "manual first, then scheduled"
+ordering with a **queue-only pause** (recurring keeps running). `resume`
+wakes the executor.
+
+### Queue
+
+Bounded `VecDeque` (`queue_capacity`, default 256; full → 429) plus a
+100-entry recent history. Job states: `pending → running → done|failed`,
+or `cancelled`. Lifetime `done`/`failed` counters and the running job appear
+in `GET /api/v1/status`; `GET /api/v1/queue` returns the full snapshot for
+the panel. The queue is in-memory only — a restart clears pending jobs while
+persisted targets reload.
+
+### Control token
+
+When `control_token` / `COLLECTOR_CONTROL_TOKEN` is set, every mutating
+endpoint requires a matching `x-control-token` header. The browser stores
+the token in `localStorage` and sends it; the `serve` proxy forwards it.
+Unset means open — deploy on a trusted network or behind nginx auth.
 
 ## Conventions
 
