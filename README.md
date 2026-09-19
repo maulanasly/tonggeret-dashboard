@@ -14,8 +14,10 @@ Fjall hot store + 20k-sample hot ring) → hourly compaction to
 `metrics_cold_*.parquet` (30d) → serve UI + `/metrics` + telemetry APIs.
 The dashboard has two modes: **hot** (`/api/v1/query_range` JSON, fresh
 within seconds, p99 unavailable) and **cold** (DuckDB-Wasm over Parquet,
-full history). Full data flow, component map, lifecycle numbers, and
-request walkthroughs: [`docs/architecture.md`](docs/architecture.md).
+full history). It also polls `/api/v1/status` for a collector health panel.
+Full data flow, component map, lifecycle numbers, request walkthroughs, and
+the split-process worker/dashboard deployment:
+[`docs/architecture.md`](docs/architecture.md).
 Day-to-day commands: `make help` (`make gate` runs the whole check suite).
 
 ## Quickstart (collector)
@@ -25,16 +27,27 @@ cargo run -- collector.toml   # scrapes beruang :8000 → :8080
 # open http://localhost:8080/ — graphs read this collector's own history
 ```
 
+Two roles share the one binary (single-binary mode is the default):
+
+```sh
+cargo run -- worker collector.toml   # scrape + store + hot API + status (loopback)
+cargo run -- serve  collector.toml   # read-only UI; proxies the worker, serves cold locally
+```
+
 `collector.toml`: targets (`name`/`url`/`allow` prefixes), `interval_secs`,
-`listen`, `static_dir`, `max_samples_per_scrape`, `max_body_bytes`,
-`[fjall]` (`dir`, `cold_dir`, `retention_days = 30`,
-`cold_purge_days = 32`). Env overrides: `COLLECTOR_LISTEN`,
-`COLLECTOR_FJALL_DIR`.
+`listen`, `static_dir`, `upstream` (worker URL for `serve`),
+`max_samples_per_scrape`, `max_body_bytes`, `[fjall]` (`dir`, `cold_dir`,
+`retention_days = 30`, `cold_purge_days = 32`). Env overrides:
+`COLLECTOR_LISTEN`, `COLLECTOR_FJALL_DIR`, `COLLECTOR_UPSTREAM`.
+Systemd units live in `deploy/`; see
+[`docs/architecture.md`](docs/architecture.md#split-process-deployment-worker--dashboard).
 
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/` | prebuilt UI bundle (`dist/`) |
 | GET | `/metrics` | collector + mirrored scraped series (Prometheus text) |
+| GET | `/healthz` | liveness for both roles |
+| GET | `/api/v1/status` | worker health: uptime, buffer/cold counts, per-target last scrape/status/failure streak |
 | GET | `/telemetry/parquet` | newest cold export (Range-capable) |
 | GET | `/telemetry/cold/:file` | named cold export, allowlisted to `metrics_cold_*.parquet` |
 | GET | `/api/files` | JSON manifest of cold files (auto-used by the UI) |
@@ -130,10 +143,13 @@ css/styles.css              # dark theme, responsive grid
 js/duckdb_worker.js         # WASM-in-Worker engine + hybrid range/fetch access
 js/duckdb_client.js         # source resolution, view lifecycle, summary math
 js/queries.js               # DOM-free SQL builders (Parquet contract)
+js/status_client.js         # /api/v1/status polling + collector health panel
 js/charts.js                # ECharts renderers (dark theme, lttb sampling)
 js/components/cards.js      # summary cards
 js/components/controls.js   # range / source / custom-visualizer wiring
 js/app.js                   # boot + orchestration (main thread only renders)
+src/status.rs               # collector status snapshot (GET /api/v1/status)
+deploy/                     # systemd units (worker + dashboard)
 scripts/mock-server.mjs     # npm run mock-server (static + CORS + Range + manifest)
 scripts/generate-mock-parquet.mjs  # npm run gen-mock (DuckDB-synthesized sample)
 scripts/build-singlefile.mjs       # npm run build → dist/index.html

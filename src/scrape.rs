@@ -15,6 +15,7 @@ use prometheus_parse::{Sample, Scrape, Value};
 
 use crate::config::TargetConfig;
 use crate::query::{now_micros, BufferedSample, RecentBuffer};
+use crate::status::StatusTracker;
 
 /// Label injected on every stored sample.
 pub const SCRAPE_TARGET_LABEL: &str = "scrape_target";
@@ -160,15 +161,19 @@ pub async fn fetch_body(
 
 /// One full scrape cycle for a target: fetch → parse → plan → store, plus
 /// `collector_*` outcome series. Every failure mode is counted, none throw.
-/// Planned samples are also mirrored into `buffer` (recent range queries).
+/// Planned samples are also mirrored into `buffer` (recent range queries),
+/// and the outcome feeds `tracker` for `GET /api/v1/status`.
 pub async fn scrape_once(
     client: &reqwest::Client,
     target: &TargetConfig,
     max_samples: usize,
     max_body: usize,
     buffer: &RecentBuffer,
+    tracker: &StatusTracker,
 ) -> ScrapeStatus {
     let now = now_micros();
+    let start = std::time::Instant::now();
+    let mut samples = 0_usize;
     let status = match fetch_body(client, &target.url, max_body).await {
         Err(e) => {
             tracing::warn!(target = %target.name, error = %e, "scrape fetch failed");
@@ -182,6 +187,7 @@ pub async fn scrape_once(
             Ok(scrape) => {
                 let (planned, dropped) =
                     plan_samples(&target.name, &scrape, &target.allow, max_samples);
+                samples = planned.len();
                 store_samples(&planned);
                 buffer.push_batch(
                     &target.name,
@@ -212,6 +218,10 @@ pub async fn scrape_once(
         target = target.name.as_str(),
         status = status.as_str()
     );
+    // Milliseconds fit `u64` for any realistic scrape; saturate on overflow.
+    #[allow(clippy::cast_possible_truncation)]
+    let duration_ms = start.elapsed().as_millis() as u64;
+    tracker.record(&target.name, status, samples, duration_ms);
     status
 }
 

@@ -64,6 +64,10 @@ pub struct Config {
     /// Largest accepted exposition body in bytes.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Worker base URL used by `serve` to reverse-proxy the hot API and
+    /// status (`COLLECTOR_UPSTREAM`). Ignored by `worker`.
+    #[serde(default = "default_upstream")]
+    pub upstream: String,
     /// Scrape targets (empty = serve-only mode, still serves history).
     #[serde(default)]
     pub targets: Vec<TargetConfig>,
@@ -94,6 +98,10 @@ fn default_recent_buffer_samples() -> usize {
 
 fn default_max_body_bytes() -> usize {
     1_048_576
+}
+
+fn default_upstream() -> String {
+    "http://127.0.0.1:8081".to_string()
 }
 
 fn default_fjall_dir() -> PathBuf {
@@ -172,6 +180,11 @@ pub fn load(path: &str) -> Result<Config, ConfigError> {
             cfg.fjall.dir = PathBuf::from(dir);
         }
     }
+    if let Ok(upstream) = std::env::var("COLLECTOR_UPSTREAM") {
+        if !upstream.trim().is_empty() {
+            cfg.upstream = upstream;
+        }
+    }
     cfg.validate()?;
     Ok(cfg)
 }
@@ -198,6 +211,14 @@ impl Config {
         if self.max_body_bytes < 1024 {
             return Err(ConfigError::Invalid(
                 "max_body_bytes must be >= 1024".to_string(),
+            ));
+        }
+        if !(self.upstream.trim().is_empty()
+            || self.upstream.starts_with("http://")
+            || self.upstream.starts_with("https://"))
+        {
+            return Err(ConfigError::Invalid(
+                "upstream must start with http(s)://".to_string(),
             ));
         }
         if self.fjall.retention_days == 0 {
@@ -249,6 +270,7 @@ mod tests {
         assert_eq!(cfg.listen, "0.0.0.0:8080");
         assert_eq!(cfg.max_samples_per_scrape, 5_000);
         assert_eq!(cfg.recent_buffer_samples, 20_000);
+        assert_eq!(cfg.upstream, "http://127.0.0.1:8081");
         assert_eq!(cfg.fjall.retention_days, 30);
         assert_eq!(cfg.fjall.cold_purge_days, 32);
         // Visitor prefixes ship in the default allowlist.
@@ -277,6 +299,10 @@ mod tests {
 
         let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
         cfg.targets[0].url = "localhost:8000/metrics".to_string();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg: Config = toml::from_str(minimal_toml()).unwrap();
+        cfg.upstream = "127.0.0.1:8081".to_string();
         assert!(cfg.validate().is_err());
     }
 

@@ -57,8 +57,12 @@ async fn scrape_flows_to_registry_and_cold_parquet() {
     };
     let client = reqwest::Client::new();
     let buffer = RecentBuffer::new(10_000);
-    let status =
-        tonggeret_dashboard::scrape::scrape_once(&client, &target, 5_000, 1_048_576, &buffer).await;
+    let tracker =
+        tonggeret_dashboard::status::StatusTracker::new(std::slice::from_ref(&target), 15, 30);
+    let status = tonggeret_dashboard::scrape::scrape_once(
+        &client, &target, 5_000, 1_048_576, &buffer, &tracker,
+    )
+    .await;
     assert_eq!(status, tonggeret_dashboard::scrape::ScrapeStatus::Ok);
 
     // The same samples land in the recent buffer backing /api/v1/query_range.

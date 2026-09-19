@@ -1,0 +1,33 @@
+# tonggeret collector worker — scrape + Fjall hot store + Parquet history.
+#
+# The only process that opens the Fjall keyspace. Binds loopback; the
+# dashboard service (or nginx) is the public surface. Install:
+#   sudo cp deploy/tonggeret-collector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tonggeret-collector
+#
+# The config's `[fjall] dir` / `cold_dir` must point at /var/lib/tonggeret
+# (created for the service user); `static_dir` is unused by this role.
+
+[Unit]
+Description=tonggeret collector worker (scrape + history)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tonggeret
+Group=tonggeret
+WorkingDirectory=/opt/tonggeret
+Environment=COLLECTOR_LISTEN=127.0.0.1:8081
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/collector worker /etc/tonggeret/collector.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tonggeret
+
+[Install]
+WantedBy=multi-user.target

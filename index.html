@@ -67,6 +67,16 @@
   <div id="errorBanner" class="banner hidden" role="alert"></div>
 
   <main id="main" class="layout">
+    <section class="panel status-panel" aria-label="collector status">
+      <header>
+        <h2><i data-lucide="server-cog"></i>Collector status</h2>
+        <span id="collectorBadge" class="badge" data-status="offline">not connected</span>
+      </header>
+      <div id="collectorStatus" class="status-body">
+        <span class="status-empty">Connect to a collector to see worker status.</span>
+      </div>
+    </section>
+
     <section class="cards" aria-label="summary">
       <article class="stat-card">
         <header><i data-lucide="hash"></i>Total Requests</header>

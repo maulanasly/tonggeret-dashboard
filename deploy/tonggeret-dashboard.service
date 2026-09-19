@@ -1,0 +1,37 @@
+# tonggeret dashboard — read-only UI + cold history, proxies the worker.
+#
+# Never opens Fjall. Serves dist/ and the shared cold Parquet locally, and
+# reverse-proxies /api/v1/{query_range,labels,status} to the worker. Stays
+# up (cold charts + "collector offline" status) while the worker restarts.
+# Install:
+#   sudo cp deploy/tonggeret-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tonggeret-dashboard
+#
+# Put nginx (TLS) in front of :8080; keep the worker's :8081 loopback-only.
+# `static_dir` in the config must point at the built dashboard `dist/`.
+
+[Unit]
+Description=tonggeret dashboard (read-only UI + history)
+After=network-online.target
+Wants=network-online.target
+After=tonggeret-collector.service
+
+[Service]
+Type=simple
+User=tonggeret
+Group=tonggeret
+WorkingDirectory=/opt/tonggeret
+Environment=COLLECTOR_LISTEN=0.0.0.0:8080
+Environment=COLLECTOR_UPSTREAM=http://127.0.0.1:8081
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/collector serve /etc/tonggeret/collector.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/tonggeret/cold
+
+[Install]
+WantedBy=multi-user.target

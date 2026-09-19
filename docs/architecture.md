@@ -5,11 +5,11 @@ keeps history, and serves a client-side dashboard. There is no query
 backend: the browser either fetches pre-aggregated JSON (hot mode) or
 queries cold Parquet files directly with DuckDB-Wasm (cold mode).
 
-The single-binary mode below is the default and the current production
-shape. [Split-process deployment](#split-process-deployment-worker--dashboard)
-specifies a target architecture that separates the scrape/storage lifecycle
-from the UI lifecycle (worker + read-only dashboard) for hosts where the
-dashboard must stay up across collector restarts.
+Both roles ship in the one binary: `collector worker` (scrape + store + hot
+APIs + `GET /api/v1/status`) and `collector serve` (read-only UI + local cold
+reads, reverse-proxying the worker). Single-binary mode (`collector
+collector.toml`, no role) stays the default. See
+[Split-process deployment](#split-process-deployment-worker--dashboard).
 
 ```
 scrape targets (/metrics) ──15s──▶ collector ──store──▶ Fjall (hot, <10 MiB)
@@ -54,17 +54,22 @@ scrape targets (/metrics) ──15s──▶ collector ──store──▶ Fjal
    (32, must exceed retention) are deleted. `data/` is local-only and
    gitignored.
 
-## Serve surface (`src/serve.rs:33`)
+## Serve surface (`src/serve.rs`)
 
-| Method | Path | Source |
-|---|---|---|
-| GET | `/` | prebuilt UI bundle (`dist/`) |
-| GET | `/metrics` | live registry text (self + mirrored scraped series) |
-| GET | `/telemetry/parquet` | newest cold export, Range-capable (404 until first compaction) |
-| GET | `/telemetry/cold/:file` | named export, allowlisted to `metrics_cold_*.parquet` |
-| GET | `/api/files` | JSON manifest of cold files |
-| GET | `/api/v1/query_range` | Prometheus matrix JSON over the hot buffer |
-| GET | `/api/v1/labels` | distinct buffered metric names (hot metric picker) |
+| Method | Path | Source | Role |
+|---|---|---|---|
+| GET | `/` | prebuilt UI bundle (`dist/`) | serve |
+| GET | `/metrics` | live registry text (self + mirrored scraped series) | worker |
+| GET | `/healthz` | `{"status":"ok"}` liveness | both |
+| GET | `/telemetry/parquet` | newest cold export, Range-capable (404 until first compaction) | both |
+| GET | `/telemetry/cold/:file` | named export, allowlisted to `metrics_cold_*.parquet` | both |
+| GET | `/api/files` | JSON manifest of cold files | both |
+| GET | `/api/v1/query_range` | Prometheus matrix JSON over the hot buffer (proxied by `serve`) | worker |
+| GET | `/api/v1/labels` | distinct buffered metric names (proxied by `serve`) | worker |
+| GET | `/api/v1/status` | worker health snapshot (proxied by `serve`; 200 `offline` when down) | worker |
+
+Both roles read the cold surface from the shared cold directory, so history
+keeps working when the worker is down; `serve` proxies only the hot APIs.
 
 Deliberately no `track` middleware: self `http_*` series would collide with
 scraped ones in the shared registry. Self-observability is the
@@ -132,9 +137,9 @@ a `{__name__,k=v}` selector URL → `renderCustom` plots the series.
 
 ## Split-process deployment (worker + dashboard)
 
-**Status: target architecture.** The single-binary mode above stays the
-default. This section specifies how to separate the scrape/storage lifecycle
-from the UI lifecycle on a host (systemd / Compose) or whenever the dashboard
+**Status: implemented.** The single-binary mode above stays the default.
+This section documents how the scrape/storage lifecycle is separated from
+the UI lifecycle on a host (systemd / Compose) or whenever the dashboard
 must survive collector restarts.
 
 ### Why split
@@ -168,17 +173,20 @@ dashboard serve (0.0.0.0:8080, read-only)
 ### Process roles
 
 One binary, two roles (`collector worker <config>` / `collector serve
-<config>`): the shared lib, tests, and CI gate stay single. A new
-`COLLECTOR_UPSTREAM` env tells `serve` where the worker is;
+<config>`): the shared lib, tests, and CI gate stay single.
+`collector [config]` (no role) stays worker for backward compatibility.
+`COLLECTOR_UPSTREAM` tells `serve` where the worker is;
 `COLLECTOR_LISTEN` / `COLLECTOR_FJALL_DIR` are unchanged.
 
 - **worker** — config → tonggeret/Fjall init → scrape loop → compaction/purge.
   Binds private/loopback. The only process that opens `data/fjall`. Serves
-  `/metrics`, the hot APIs, and `/api/v1/status`. Does not serve `dist/`.
+  `/metrics`, the hot APIs, `/api/v1/status`, and `/healthz`. Does not serve
+  `dist/`.
 - **serve** — read-only. Serves `dist/` and the cold-file surface
   (`/api/files`, `/telemetry/parquet`, `/telemetry/cold/:file`) directly from
-  the shared `data/cold`. Reverse-proxies `/api/v1/{query_range,labels,status}`
-  to `COLLECTOR_UPSTREAM`. Never opens `data/fjall`.
+  the shared `data/cold`, and `/healthz`. Reverse-proxies
+  `/api/v1/{query_range,labels,status}` to `COLLECTOR_UPSTREAM`. Never opens
+  `data/fjall`.
 
 ### Status contract (`GET /api/v1/status`)
 
@@ -264,15 +272,17 @@ Two units on one host, with nginx terminating TLS in front of the dashboard
   durability path; polling/proxying the HTTP contract is simpler and reuses
   the existing hot API.
 
-### Migration phases
+### Rollout
 
-1. Single process: add `StatusState` + `GET /api/v1/status` + the dashboard
-   status panel — status visibility with no topology change.
-2. Add the `worker`/`serve` roles + `COLLECTOR_UPSTREAM`; split the serve
-   router (cold local, hot proxied, explicit 503 when upstream is down); add
-   `/healthz` to both roles.
-3. Ship the systemd units + docs; keep single-process mode as the default
-   until the split is proven in production.
+1. **Status** (`src/status.rs`, `GET /api/v1/status`): per-target recency and
+   failure streaks, rendered by the dashboard status panel. Works in both
+   single-binary and split modes.
+2. **Role split** (`collector worker` / `collector serve` + `COLLECTOR_UPSTREAM`):
+   cold served locally, hot API + status proxied, 503 on upstream failure,
+   `/healthz` on both roles.
+3. **Deploy**: `deploy/tonggeret-collector.service` +
+   `deploy/tonggeret-dashboard.service`. Single-binary mode remains the
+   default until the split is proven in production.
 
 ## Conventions
 
