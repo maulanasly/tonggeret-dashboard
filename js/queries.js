@@ -40,14 +40,29 @@ function bucketExpr(range) {
   return `date_trunc('${part}', ts)`;
 }
 
+/// `AND`-fragment restricting rows to one `scrape_target` (`''`/`all` = no
+/// filter). Returns `''` when unfiltered so callers can append it directly.
+function targetFilter(target) {
+  const t = String(target ?? '').trim();
+  if (t === '' || t === 'all') return '';
+  return ` AND json_extract_string(labels, '$.scrape_target') = '${lit(t)}'`;
+}
+
+/// WHERE clause combining the time range and an optional target filter.
+function whereClause(range, target) {
+  return `${timeFilter(range)}${targetFilter(target)}`;
+}
+
 export const Queries = {
   Ranges,
   timeFilter,
   bucketExpr,
+  targetFilter,
+  whereClause,
 
   /// Request throughput + latency breakdown in a single round-trip.
-  throughputLatency(range) {
-    const filter = timeFilter(range);
+  throughputLatency(range, target = '') {
+    const filter = whereClause(range, target);
     const bucket = bucketExpr(range);
     return (
       `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
@@ -62,8 +77,8 @@ export const Queries = {
   },
 
   /// HTTP 4xx/5xx breakdown grouped by endpoint path.
-  errorDistribution(range) {
-    const filter = timeFilter(range);
+  errorDistribution(range, target = '') {
+    const filter = whereClause(range, target);
     return (
       `SELECT COALESCE(NULLIF(json_extract_string(labels, '$.path'), ''), '(unknown)') AS path,\n` +
       `  count(*) FILTER (WHERE json_extract_string(labels, '$.status') LIKE '4%') AS c4xx,\n` +
@@ -83,12 +98,23 @@ export const Queries = {
     return 'SELECT DISTINCT name FROM metrics_all ORDER BY 1 LIMIT 200';
   },
 
+  /// Distinct `scrape_target` values (target-filter options when the
+  /// collector's registry is unavailable, e.g. static Parquet hosting).
+  listTargets() {
+    return (
+      `SELECT DISTINCT COALESCE(NULLIF(json_extract_string(labels, '$.scrape_target'), ''), '(unknown)') AS target\n` +
+      `FROM metrics_all\n` +
+      `WHERE name = 'http_requests_total'\n` +
+      `ORDER BY 1`
+    );
+  },
+
   /// Visitor preset: latest `visitors_total` and `unique_visitors_estimate`
   /// per bucket, grouped by target + region. Both are read as latest
   /// (`arg_max(value, ts)`): the uniques estimate is a gauge and must
   /// never be summed — take latest per `(target, region)`.
-  visitorsByRegion(range) {
-    const filter = timeFilter(range);
+  visitorsByRegion(range, target = '') {
+    const filter = whereClause(range, target);
     const bucket = bucketExpr(range);
     return (
       `SELECT epoch_us(${bucket}) AS bucket_us,\n` +
@@ -105,11 +131,18 @@ export const Queries = {
 
   /// General-purpose counter/gauge series builder.
   ///
-  /// `opts`: `{ metric, agg, labelKey, labelValue, range }`.
+  /// `opts`: `{ metric, agg, labelKey, labelValue, range, target }`.
   /// `agg` ∈ `count|sum|avg|min|max|p50|p99`.
   customSeries(opts) {
-    const { metric, agg = 'avg', labelKey = '', labelValue = '', range = '24h' } = opts;
-    const filter = timeFilter(range);
+    const {
+      metric,
+      agg = 'avg',
+      labelKey = '',
+      labelValue = '',
+      range = '24h',
+      target = '',
+    } = opts;
+    const filter = whereClause(range, target);
     const bucket = bucketExpr(range);
     const aggSql = (() => {
       switch (agg) {

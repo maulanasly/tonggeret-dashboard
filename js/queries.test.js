@@ -33,6 +33,22 @@ describe('bucketExpr', () => {
   });
 });
 
+describe('targetFilter', () => {
+  it('is empty for all/blank and a scrape_target equality otherwise', () => {
+    assert.equal(Queries.targetFilter(''), '');
+    assert.equal(Queries.targetFilter('all'), '');
+    assert.equal(Queries.targetFilter(undefined), '');
+    assert.equal(
+      Queries.targetFilter('beruang'),
+      " AND json_extract_string(labels, '$.scrape_target') = 'beruang'",
+    );
+  });
+
+  it('escapes single quotes in the target name', () => {
+    assert.match(Queries.targetFilter("o'brien"), /'o''brien'/);
+  });
+});
+
 describe('throughputLatency', () => {
   it('queries the request/latency series with microsecond buckets', () => {
     const sql = Queries.throughputLatency('24h');
@@ -41,6 +57,11 @@ describe('throughputLatency', () => {
     assert.match(sql, /name = 'http_request_duration_ms'/);
     assert.match(sql, /bucket_us/);
     assert.match(sql, /INTERVAL 24 HOUR/);
+  });
+
+  it('adds the scrape_target predicate when filtered', () => {
+    const sql = Queries.throughputLatency('24h', 'beruang');
+    assert.match(sql, /\$\.scrape_target'\) = 'beruang'/);
   });
 });
 
@@ -51,11 +72,24 @@ describe('errorDistribution', () => {
     assert.match(sql, /LIKE '4%'|LIKE '5%'/);
     assert.match(sql, /INTERVAL 1 HOUR/);
   });
+
+  it('adds the scrape_target predicate when filtered', () => {
+    assert.match(Queries.errorDistribution('1h', 'hitung'), /\$\.scrape_target'\) = 'hitung'/);
+  });
 });
 
 describe('listMetricNames', () => {
   it('selects distinct names', () => {
     assert.match(Queries.listMetricNames(), /SELECT DISTINCT name FROM metrics_all/);
+  });
+});
+
+describe('listTargets', () => {
+  it('selects distinct scrape_target values from request rows', () => {
+    const sql = Queries.listTargets();
+    assert.match(sql, /SELECT DISTINCT/);
+    assert.match(sql, /\$\.scrape_target/);
+    assert.match(sql, /name = 'http_requests_total'/);
   });
 });
 

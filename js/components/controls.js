@@ -29,6 +29,7 @@ export const Controls = {
       if (e.key === 'Enter') this.handleRefresh(true);
     });
     document.getElementById('rangeSelect')?.addEventListener('change', () => this.handleRefresh(false));
+    document.getElementById('targetFilter')?.addEventListener('change', () => this.handleRefresh(false));
     document.getElementById('refreshBtn')?.addEventListener('click', () => this.handleRefresh(false));
     document.getElementById('customRun')?.addEventListener('click', () => onCustom?.());
     document.getElementById('freezeBtn')?.addEventListener('click', () => onFreeze?.());
@@ -101,6 +102,32 @@ export const Controls = {
     return ['1h', '24h', 'all'].includes(r) ? r : '24h';
   },
 
+  /// Selected target filter (`'all'` = no filter).
+  getTarget() {
+    return val('targetFilter').trim() || 'all';
+  },
+
+  /// Repopulate the target filter, preserving the current selection when it
+  /// still exists (otherwise reset to "All targets").
+  setTargets(names) {
+    const sel = document.getElementById('targetFilter');
+    if (!sel) return;
+    const list = Array.isArray(names) ? [...new Set(names.filter(Boolean))].sort() : [];
+    const prev = sel.value || 'all';
+    sel.innerHTML = '';
+    const all = document.createElement('option');
+    all.value = 'all';
+    all.textContent = 'All targets';
+    sel.appendChild(all);
+    for (const n of list) {
+      const opt = document.createElement('option');
+      opt.value = n;
+      opt.textContent = n;
+      sel.appendChild(opt);
+    }
+    sel.value = list.includes(prev) || prev === 'all' ? prev : 'all';
+  },
+
   getCustom() {
     return {
       metric: val('metricSelect').trim() || 'http_request_duration_ms',
@@ -108,6 +135,7 @@ export const Controls = {
       labelKey: val('labelKey').trim(),
       labelValue: val('labelValue').trim(),
       range: this.getRange(),
+      target: this.getTarget(),
     };
   },
 

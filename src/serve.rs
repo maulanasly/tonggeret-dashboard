@@ -1139,6 +1139,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_api_disables_config_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_for(dir.path(), &["app"]);
+        let app = control_app(
+            dir.path(),
+            registry,
+            tracker_for(&["app"]),
+            Arc::new(JobQueue::new(16)),
+            None,
+        );
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/v1/targets/cfg:app/disable",
+            "",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["enabled"], false);
+
+        let (_, body) = get(app, "/api/v1/targets").await;
+        assert_eq!(body["targets"][0]["enabled"], false);
+    }
+
+    #[tokio::test]
     async fn control_api_validates_and_maps_errors() {
         let dir = tempfile::tempdir().unwrap();
         let registry = registry_for(dir.path(), &["app"]);
@@ -1157,8 +1184,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body["detail"].as_str().unwrap().contains("http"));
 
-        let (status, _) = request(app.clone(), "DELETE", "/api/v1/targets/cfg:app", "", &[]).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // Config targets are now removable/disable-able (persisted override).
+        let (status, body) =
+            request(app.clone(), "DELETE", "/api/v1/targets/cfg:app", "", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], "cfg:app");
+        let (_, body) = get(app.clone(), "/api/v1/targets").await;
+        assert!(body["targets"].as_array().unwrap().is_empty());
 
         let (status, _) = request(app.clone(), "DELETE", "/api/v1/targets/nope", "", &[]).await;
         assert_eq!(status, StatusCode::NOT_FOUND);

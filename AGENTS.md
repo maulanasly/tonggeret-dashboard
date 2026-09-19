@@ -80,15 +80,23 @@ data/            LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history) 
   are plain shared memory + client timers. The **unified executor** is the
   one task: interval tick + queue drain in the same task (no overlap), with
   a bounded queue (`queue_capacity`, default 256) + 100-entry history.
-- **Dynamic targets + queue (load-bearing).** `TargetRegistry` mutates
-  runtime state and persists only dynamic targets to `state.targets_file`
-  atomically; config targets are immutable. `JobQueue::pop_next` is
+- **Dynamic targets + queue (load-bearing).** `TargetRegistry` persists to
+  `state.targets_file` atomically: dynamically added targets plus
+  `overrides` for config targets (disable/tombstone), so a removed or
+  disabled `collector.toml` target stays that way across restarts (a legacy
+  bare-array file is still read). `JobQueue::pop_next` is
   **manual-first while running, scheduled-only while paused** — pause never
   stops the recurring sweep; **freeze** (`worker/freeze`) is a superset that
   halts everything until resume. Control endpoints mutate state and require
   `x-control-token` when `control_token`/`COLLECTOR_CONTROL_TOKEN` is set
   (browser stores it, `serve` forwards it). Errors: 422 bad input, 429
   queue/target cap, 404 unknown id.
+- **Target filter.** The top-bar `targetFilter` scopes the summary cards and
+  every chart to one `scrape_target`; it threads through both data paths
+  (`Queries.*(range, target)` cold, `{__name__,scrape_target}` selectors
+  hot). Options come from `/api/v1/targets` when hot, else
+  `Queries.listTargets()`. Queue "recent" shows only the newest 5 (backend
+  keeps 100).
 - **Frozen connection.** The dashboard binds to `window.location.origin` by
   default (no source input); the top bar is a connection chip + freeze
   toggle. The Advanced toggle reveals the source field for static hosting;

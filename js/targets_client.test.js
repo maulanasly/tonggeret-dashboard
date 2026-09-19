@@ -49,6 +49,16 @@ test('ageText rounds to human units', () => {
   assert.equal(TargetsClient.ageText(100 - 172800, 100), '2d ago');
 });
 
+test('recentRuns keeps only the newest 5 by default', () => {
+  const queue = { recent: Array.from({ length: 12 }, (_, i) => ({ id: `j${i}` })) };
+  const runs = TargetsClient.recentRuns(queue);
+  assert.equal(runs.length, 5);
+  assert.equal(runs[0].id, 'j0');
+  assert.deepEqual(TargetsClient.recentRuns({ recent: [{ id: 'a' }] }), [{ id: 'a' }]);
+  assert.deepEqual(TargetsClient.recentRuns(null), []);
+  assert.equal(TargetsClient.recentRuns({ recent: [] }, 2).length, 0);
+});
+
 test('esc neutralizes HTML in labels', () => {
   assert.equal(
     TargetsClient.esc('<script>"&'),
