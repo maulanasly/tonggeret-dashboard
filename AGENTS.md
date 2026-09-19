@@ -14,17 +14,17 @@ Rust 1.85+ (collector) · Node 18+ (dashboard `npm run` scripts only) ·
 ## Workflow
 
 1. Feature branch off `main` → implement + test
-2. Gate must be green before commit:
+2. Gate must be green before commit — `make gate` (or, explicitly:
    `cargo clippy --all-targets -- -D warnings` ·
    `cargo fmt --check` · `cargo test` · `cargo audit` ·
-   `node --check js/*.js js/components/*.js`
+   `node --check js/*.js js/components/*.js` · `npm test`)
 3. Push → PR to `main`
 
 ## Verification
 
 | Command | What |
 |---|---|
-| `cargo test` | 14 unit (mapping/allowlist/config/serve) + e2e scrape→registry→Parquet |
+| `cargo test` | 29 unit (mapping/allowlist/config/serve/query incl. HTTP-level) + e2e scrape→registry→Parquet |
 | `cargo audit` | vulnerabilities fail; `paste`/`lexical-core` informationals allowed (upstream, see tonggeret repo) |
 | `npm run mock-server` | isolated UI dev without the collector |
 
