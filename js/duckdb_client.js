@@ -26,6 +26,18 @@ function normErrorRow(r) {
   };
 }
 
+/// Normalize one visitor-preset row (BigInt-safe; nulls stay null so the
+/// chart can distinguish "no samples" from zero).
+function normVisitorRow(r) {
+  return {
+    bucket_us: Number(r.bucket_us),
+    target: String(r.target ?? '(unknown)'),
+    region: String(r.region ?? '(unknown)'),
+    visitors: r.visitors == null ? null : Number(num(r.visitors)),
+    uniques: r.uniques == null ? null : Number(num(r.uniques)),
+  };
+}
+
 /// Try `<base>/api/files` manifest (mock-server + future backends).
 /// Returns absolute URLs or null when no manifest exists.
 async function tryManifest(base) {
@@ -75,16 +87,19 @@ export const DataSource = {
     const throughputSql = Queries.throughputLatency(range);
     const errorsSql = Queries.errorDistribution(range);
     const namesSql = Queries.listMetricNames();
-    const [tRows, eRows, nRows] = await Promise.all([
+    const visitorsSql = Queries.visitorsByRegion(range);
+    const [tRows, eRows, nRows, vRows] = await Promise.all([
       WorkerEngine.query(throughputSql, onStatus, 'aggregating throughput + latency…'),
       WorkerEngine.query(errorsSql, onStatus, 'aggregating error distribution…'),
       WorkerEngine.query(namesSql, onStatus, 'listing metric names…').catch(() => []),
+      WorkerEngine.query(visitorsSql, onStatus, 'aggregating visitors…').catch(() => []),
     ]);
     const throughput = tRows.map(normThroughputRow);
     const errors = eRows.map(normErrorRow);
     const names = nRows.map((r) => String(r.name));
+    const visitors = vRows.map(normVisitorRow);
     const bucketSecs = Queries.Ranges[range]?.bucketSecs ?? 3600;
-    return { throughput, errors, names, summary: this.summarize(throughput, errors, bucketSecs) };
+    return { throughput, errors, names, visitors, summary: this.summarize(throughput, errors, bucketSecs) };
   },
 
   async runCustom(opts, onStatus) {

@@ -70,7 +70,7 @@ impl RecentBuffer {
     /// Test hook: current length.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().map(|q| q.len()).unwrap_or(0)
+        self.inner.lock().map_or(0, |q| q.len())
     }
 
     /// Append samples from one scrape of `target`; evict oldest past capacity.
@@ -410,8 +410,7 @@ pub fn render_matrix(outcome: &QueryOutcome) -> serde_json::Value {
 pub fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_micros().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_micros().try_into().unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
