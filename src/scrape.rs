@@ -24,6 +24,8 @@ pub const SCRAPE_TARGET_LABEL: &str = "scrape_target";
 const DENY_EXACT: &[&str] = &["tonggeret_dropped_total"];
 /// Series-name prefixes reserved for this collector's own outcome series;
 /// never stored from scraped input (same collision + feedback reason).
+/// Do not re-add to any allowlist: this deny is checked before the allow
+/// check in [`plan_samples`], so an allow entry could never match.
 const DENY_PREFIX: &[&str] = &["collector_"];
 
 /// One storable observation derived from exposition.
@@ -291,14 +293,7 @@ fn format_float(v: f64) -> String {
 mod tests {
     use super::*;
 
-    const ALLOW: &[&str] = &[
-        "http_",
-        "beruang_",
-        "tonggeret_",
-        "collector_",
-        "visitors_",
-        "unique_",
-    ];
+    const ALLOW: &[&str] = &["http_", "beruang_", "tonggeret_", "visitors_", "unique_"];
 
     fn allow() -> Vec<String> {
         ALLOW.iter().map(ToString::to_string).collect()

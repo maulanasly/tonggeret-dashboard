@@ -25,11 +25,13 @@ cold_purge_days = 32
 [[targets]]
 name = "beruang"
 url = "http://localhost:8000/metrics"
-# Series-name prefixes accepted from this target. Visitor series
+# Series-name prefixes accepted from this target. `collector_*` is denied
+# before the allow check (it is this collector's own series namespace),
+# so it must not be listed here. Visitor series
 # (`visitors_total`, `unique_visitors_estimate`) are covered by the
 # `visitors_`/`unique_` entries: an app without them scrapes fine,
 # it simply stores zero visitor rows.
-allow = ["http_", "beruang_", "tonggeret_", "collector_", "visitors_", "unique_"]
+allow = ["http_", "beruang_", "tonggeret_", "visitors_", "unique_"]
 
 # [[targets]]
 # name = "example"

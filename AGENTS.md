@@ -56,8 +56,9 @@ data/              LOCAL ONLY, gitignored: data/fjall (hot) + data/cold (history
     would collide with scraped `http_*` (+`scrape_target`) and panic the
     registry. Self-observability is the `collector_*` outcome series.
   - residual risk (documented, accepted): two targets emitting the same
-    name with *different* label keys merge positionally — keep
-    instrumentation consistent across scraped apps.
+    name with *different* label keys are warn-dropped by the registry
+    (samples lost, no panic) — keep instrumentation consistent across
+    scraped apps.
   - never add the collector as its own target.
 - **Histograms/summaries** are stored as cumulative bucket/quantile
   counters (`*_bucket{le}`, `*`+`quantile`); never `sum()` gauge estimates
